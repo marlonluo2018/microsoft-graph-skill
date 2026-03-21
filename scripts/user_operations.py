@@ -15,7 +15,15 @@ Usage:
 import os
 import sys
 import argparse
+from pathlib import Path
 from typing import List, Optional, Dict, Any
+
+# Add parent directory to path for config import
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Import configuration and auth
+from config import GRAPH_API_BASE
+from auth import get_access_token
 
 # Try to import requests
 try:
@@ -24,12 +32,6 @@ except ImportError:
     print("Error: requests package not found.")
     print("Install with: pip install requests")
     sys.exit(1)
-
-# Import auth module
-from auth import get_access_token
-
-# Constants
-GRAPH_API_BASE = "https://graph.microsoft.com/v1.0"
 
 
 def get_headers(token: str) -> Dict[str, str]:

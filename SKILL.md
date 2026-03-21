@@ -1,9 +1,9 @@
 ---
-name: microsoft-graph
+name: microsoft-graph-skill
 description: This skill should be used when the user needs to interact with Microsoft Graph API for email operations (read, send, reply, forward), calendar management (create events, query availability), or user/contact queries. Use this skill for Outlook email automation, Teams calendar operations, and Microsoft 365 user management. Triggers include requests like "read my emails", "send an email to...", "check calendar availability", "create a meeting", or "find user information".
 ---
 
-# Microsoft Graph
+# Microsoft Graph Skill
 
 ## Overview
 

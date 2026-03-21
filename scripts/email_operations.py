@@ -17,8 +17,19 @@ import os
 import sys
 import json
 import argparse
+from pathlib import Path
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+
+# Add parent directory to path for config import
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Import configuration and auth
+from config import (
+    GRAPH_API_BASE, MAX_RECIPIENTS_PER_EMAIL,
+    MAX_MESSAGE_DISPLAY_LENGTH, MAX_BODY_DISPLAY_LENGTH
+)
+from auth import get_access_token
 
 # Try to import requests
 try:
@@ -28,12 +39,8 @@ except ImportError:
     print("Install with: pip install requests")
     sys.exit(1)
 
-# Import auth module
-from auth import get_access_token, DEFAULT_SCOPES
-
 # Constants
-GRAPH_API_BASE = "https://graph.microsoft.com/v1.0"
-MAX_RECIPIENTS = 500  # Company policy limit
+MAX_RECIPIENTS = MAX_RECIPIENTS_PER_EMAIL
 
 
 def get_headers(token: str) -> Dict[str, str]:
@@ -605,7 +612,7 @@ def display_thread(messages: List[Dict]):
             content = html_module.unescape(content)
             content = re.sub(r'\s+', ' ', content).strip()
             # Limit length for thread view
-            if len(content) > 1000:
+            if len(content) > MAX_BODY_DISPLAY_LENGTH:
                 content = content[:1000] + '...'
         
         # Handle encoding issues
@@ -693,8 +700,8 @@ def display_message(message: Dict):
         # Clean up whitespace
         content = re.sub(r'\s+', ' ', content).strip()
         # Limit length
-        if len(content) > 2000:
-            content = content[:2000] + '...'
+        if len(content) > MAX_MESSAGE_DISPLAY_LENGTH:
+            content = content[:MAX_MESSAGE_DISPLAY_LENGTH] + '...'
     
     # Handle encoding issues
     try:

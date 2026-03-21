@@ -20,31 +20,22 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any
 
+# Add parent directory to path for config import
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Import configuration
+from config import (
+    TENANT_ID, CLIENT_ID, DEFAULT_SCOPES,
+    CACHE_DIR, TOKEN_CACHE_FILE, DEVICE_FLOW_FILE,
+    ensure_cache_dir, get_client_id
+)
+
 # Try to import msal, provide guidance if not available
 try:
     from msal import PublicClientApplication
 except ImportError:
     print(json.dumps({"error": "msal package not found. Install with: pip install msal"}))
     sys.exit(1)
-
-# Configuration
-# Use Microsoft Office public client ID - this is pre-authorized for Microsoft Graph API
-TENANT_ID = "organizations"  # Use "organizations" for company accounts, "common" for all
-
-# Microsoft Office public client ID (pre-authorized for Graph API)
-DEFAULT_CLIENT_ID = "d3590ed6-52b3-4102-aeff-aad2292ab01c"
-
-# Can be overridden by environment variable or parameter
-CLIENT_ID = DEFAULT_CLIENT_ID
-
-# Default scopes for Microsoft Graph
-# Using .default scope to request all permissions configured for the app
-DEFAULT_SCOPES = ["https://graph.microsoft.com/.default"]
-
-# Cache locations
-CACHE_DIR = Path.home() / ".ms_graph_skill"
-TOKEN_FILE = CACHE_DIR / "tokens.json"
-DEVICE_FLOW_FILE = CACHE_DIR / "device_flow.json"
 
 
 def ensure_cache_dir():
@@ -69,11 +60,11 @@ class TokenManager:
     
     def load_tokens_from_disk(self) -> None:
         """Load authentication tokens from disk."""
-        if not TOKEN_FILE.exists():
+        if not TOKEN_CACHE_FILE.exists():
             return
         
         try:
-            with open(TOKEN_FILE, "r") as f:
+            with open(TOKEN_CACHE_FILE, "r") as f:
                 token_data = json.load(f)
             
             self.access_token = token_data.get("access_token")
@@ -100,7 +91,7 @@ class TokenManager:
             "authenticated": self.authenticated,
             "username": self.username,
         }
-        with open(TOKEN_FILE, "w") as f:
+        with open(TOKEN_CACHE_FILE, "w") as f:
             json.dump(token_data, f, indent=2)
     
     def update_token(
@@ -125,8 +116,8 @@ class TokenManager:
         self.refresh_token = None
         self.authenticated = False
         self.username = None
-        if TOKEN_FILE.exists():
-            TOKEN_FILE.unlink()
+        if TOKEN_CACHE_FILE.exists():
+            TOKEN_CACHE_FILE.unlink()
     
     def is_token_valid(self) -> bool:
         """Check if the current token is valid and not expired."""
