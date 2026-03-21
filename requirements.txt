@@ -1,0 +1,7 @@
+# Microsoft Graph Skill Dependencies
+
+# Microsoft Authentication Library for Python
+msal>=1.20.0
+
+# HTTP requests
+requests>=2.28.0
