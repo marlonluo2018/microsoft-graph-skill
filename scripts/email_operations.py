@@ -152,6 +152,124 @@ def list_messages(
 
 
 # =============================================================================
+# SEARCH MESSAGES
+# =============================================================================
+
+def search_messages(
+    from_sender: str = None,
+    to_recipient: str = None,
+    subject: str = None,
+    body: str = None,
+    folder: str = "inbox",
+    limit: int = 25,
+    token: str = None
+) -> List[Dict[str, Any]]:
+    """
+    Search messages by various criteria.
+    
+    Uses $search for initial filtering, then applies client-side filtering
+    for more specific criteria like sender name matching.
+    
+    Args:
+        from_sender: Sender name or email to search for
+        to_recipient: Recipient name or email to search for
+        subject: Subject contains this text
+        body: Body contains this text
+        folder: Folder name or 'all' for all folders
+        limit: Maximum number of messages to return
+        token: Access token
+    
+    Returns:
+        List of message objects
+    """
+    if token is None:
+        token = get_access_token()
+    
+    # Build search keywords (for $search parameter)
+    search_keywords = []
+    if from_sender:
+        search_keywords.append(from_sender)
+    if to_recipient:
+        search_keywords.append(to_recipient)
+    if subject:
+        search_keywords.append(subject)
+    if body:
+        search_keywords.append(body)
+    
+    # Map common folder names to well-known folder IDs
+    folder_map = {
+        "inbox": "inbox",
+        "sent": "sentitems",
+        "sentitems": "sentitems",
+        "drafts": "drafts",
+        "deleted": "deleteditems",
+        "deleteditems": "deleteditems",
+        "junk": "junkemail",
+        "junkemail": "junkemail",
+        "outbox": "outbox"
+    }
+    
+    if folder.lower() == "all":
+        url = f"{GRAPH_API_BASE}/me/messages"
+    else:
+        folder_id = folder_map.get(folder.lower(), folder)
+        url = f"{GRAPH_API_BASE}/me/mailFolders/{folder_id}/messages"
+    
+    # Use $search if we have keywords, otherwise just list
+    if search_keywords:
+        search_query = " ".join(search_keywords)
+        params = {
+            "$search": f'"{search_query}"',
+            "$top": min(limit * 3, 100),  # Get more results for client-side filtering
+            "$select": "id,subject,from,toRecipients,receivedDateTime,isRead,hasAttachments"
+        }
+    else:
+        params = {
+            "$top": limit,
+            "$select": "id,subject,from,toRecipients,receivedDateTime,isRead,hasAttachments",
+            "$orderby": "receivedDateTime desc"
+        }
+    
+    response = requests.get(url, headers=get_headers(token), params=params)
+    
+    if response.status_code != 200:
+        raise Exception(f"Failed to search messages: {response.status_code} - {response.text}")
+    
+    data = response.json()
+    messages = data.get("value", [])
+    
+    # Apply client-side filtering for more precise matching
+    if from_sender:
+        from_lower = from_sender.lower()
+        messages = [
+            m for m in messages
+            if from_lower in m.get('from', {}).get('emailAddress', {}).get('name', '').lower()
+            or from_lower in m.get('from', {}).get('emailAddress', {}).get('address', '').lower()
+        ]
+    
+    if to_recipient:
+        to_lower = to_recipient.lower()
+        messages = [
+            m for m in messages
+            if any(
+                to_lower in r.get('emailAddress', {}).get('name', '').lower()
+                or to_lower in r.get('emailAddress', {}).get('address', '').lower()
+                for r in m.get('toRecipients', [])
+            )
+        ]
+    
+    if subject:
+        subject_lower = subject.lower()
+        messages = [
+            m for m in messages
+            if subject_lower in m.get('subject', '').lower()
+        ]
+    
+    # Limit results
+    return messages[:limit]
+
+
+# =============================================================================
 # GET MESSAGE
 # =============================================================================
 
@@ -384,6 +502,123 @@ def mark_as_unread(message_id: str, token: str = None) -> bool:
 
 
 # =============================================================================
+# GET EMAIL THREAD (CONVERSATION)
+# =============================================================================
+
+def get_message_thread(message_id: str, token: str = None) -> List[Dict[str, Any]]:
+    """
+    Get all messages in the same conversation thread.
+    
+    Args:
+        message_id: ID of any message in the conversation
+        token: Access token
+    
+    Returns:
+        List of messages in the conversation, ordered by date
+    """
+    if token is None:
+        token = get_access_token()
+    
+    # First get the message with conversation ID and subject
+    url = f"{GRAPH_API_BASE}/me/messages/{message_id}?$select=conversationId,subject"
+    response = requests.get(url, headers=get_headers(token))
+    
+    if response.status_code != 200:
+        raise Exception(f"Failed to get message: {response.status_code} - {response.text}")
+    
+    message = response.json()
+    conversation_id = message.get('conversationId')
+    subject = message.get('subject', '')
+    
+    if not conversation_id:
+        raise Exception("No conversation ID found for this message")
+    
+    # Use conversation ID directly to get messages
+    # Graph API supports /me/messages/{id} with $expand for conversation
+    url = f"{GRAPH_API_BASE}/me/messages"
+    
+    # Try using $search with conversation index
+    # Extract keywords from subject for searching
+    search_terms = subject.replace('RE:', '').replace('FW:', '').replace('Fw:', '').strip()
+    if len(search_terms) > 50:
+        search_terms = search_terms[:50]
+    
+    params = {
+        "$search": f'"{search_terms}"',
+        "$top": 50,
+        "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,conversationId,internetMessageId"
+    }
+    
+    response = requests.get(url, headers=get_headers(token), params=params)
+    
+    if response.status_code != 200:
+        raise Exception(f"Failed to get thread: {response.status_code} - {response.text}")
+    
+    # Filter to only messages in the same conversation
+    all_messages = response.json().get("value", [])
+    thread_messages = [m for m in all_messages if m.get('conversationId') == conversation_id]
+    
+    # Sort by receivedDateTime ascending (oldest first)
+    thread_messages.sort(key=lambda x: x.get('receivedDateTime', ''))
+    
+    return thread_messages
+
+
+def display_thread(messages: List[Dict]):
+    """Display a conversation thread in chronological order."""
+    import re
+    import html as html_module
+    
+    if not messages:
+        print("No messages in thread.")
+        return
+    
+    print(f"\n{'='*80}")
+    print(f"CONVERSATION THREAD ({len(messages)} messages)")
+    print(f"Subject: {messages[0].get('subject', '(No Subject)')}")
+    print(f"{'='*80}")
+    
+    for i, msg in enumerate(messages, 1):
+        print(f"\n--- Message {i}/{len(messages)} ---")
+        print(f"From: {msg.get('from', {}).get('emailAddress', {}).get('name', 'Unknown')}")
+        print(f"      <{msg.get('from', {}).get('emailAddress', {}).get('address', '')}>")
+        print(f"Date: {msg.get('receivedDateTime', '')}")
+        
+        to_list = [r.get('emailAddress', {}).get('name', '') for r in msg.get('toRecipients', [])]
+        cc_list = [r.get('emailAddress', {}).get('name', '') for r in msg.get('ccRecipients', [])]
+        if to_list:
+            print(f"To: {', '.join(to_list)}")
+        if cc_list:
+            print(f"Cc: {', '.join(cc_list)}")
+        
+        print(f"\n")
+        
+        # Get body content
+        body = msg.get('body', {})
+        content = body.get('content', '')
+        content_type = body.get('contentType', 'text')
+        
+        # If HTML, extract plain text
+        if content_type == 'html' and content:
+            content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL)
+            content = re.sub(r'<[^>]+>', ' ', content)
+            content = html_module.unescape(content)
+            content = re.sub(r'\s+', ' ', content).strip()
+            # Limit length for thread view
+            if len(content) > 1000:
+                content = content[:1000] + '...'
+        
+        # Handle encoding issues
+        try:
+            print(content)
+        except UnicodeEncodeError:
+            print(content.encode('ascii', 'replace').decode('ascii'))
+    
+    print(f"\n{'='*80}")
+    print(f"End of thread ({len(messages)} messages)")
+
+
+# =============================================================================
 # DELETE EMAIL
 # =============================================================================
 
@@ -432,6 +667,8 @@ def display_message_list(messages: List[Dict]):
 
 def display_message(message: Dict):
     """Display a single message in detail."""
+    import re
+    
     print(f"\n{'='*80}")
     print(f"Subject: {message.get('subject', '(No Subject)')}")
     print(f"From: {message.get('from', {}).get('emailAddress', {})}")
@@ -439,7 +676,33 @@ def display_message(message: Dict):
     print(f"CC: {[r.get('emailAddress', {}) for r in message.get('ccRecipients', [])]}")
     print(f"Date: {message.get('receivedDateTime', '')}")
     print(f"{'='*80}")
-    print(f"\n{message.get('body', {}).get('content', '')}")
+    
+    # Get body content
+    body = message.get('body', {})
+    content = body.get('content', '')
+    content_type = body.get('contentType', 'text')
+    
+    # If HTML, try to extract plain text
+    if content_type == 'html' and content:
+        # Remove HTML tags
+        content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL)
+        content = re.sub(r'<[^>]+>', ' ', content)
+        # Decode HTML entities
+        import html
+        content = html.unescape(content)
+        # Clean up whitespace
+        content = re.sub(r'\s+', ' ', content).strip()
+        # Limit length
+        if len(content) > 2000:
+            content = content[:2000] + '...'
+    
+    # Handle encoding issues
+    try:
+        print(f"\n{content}")
+    except UnicodeEncodeError:
+        # Fallback: encode to ASCII with replacement
+        print(f"\n{content.encode('ascii', 'replace').decode('ascii')}")
+    
     print(f"\n{'='*80}")
 
 
@@ -458,9 +721,22 @@ def main():
     list_parser.add_argument("--filter", dest="filter_query", help="OData filter query")
     list_parser.add_argument("--unread", action="store_true", help="Show unread only")
     
+    # Search command
+    search_parser = subparsers.add_parser("search", help="Search messages")
+    search_parser.add_argument("--from", dest="from_sender", help="Sender name or email")
+    search_parser.add_argument("--to", dest="to_recipient", help="Recipient name or email")
+    search_parser.add_argument("--subject", help="Subject contains")
+    search_parser.add_argument("--body", help="Body contains")
+    search_parser.add_argument("--folder", default="inbox", help="Folder name (or 'all' for all folders)")
+    search_parser.add_argument("--limit", type=int, default=25, help="Max messages to return")
+    
     # Get command
     get_parser = subparsers.add_parser("get", help="Get a message")
     get_parser.add_argument("message_id", help="Message ID")
+    
+    # Thread command
+    thread_parser = subparsers.add_parser("thread", help="Get conversation thread")
+    thread_parser.add_argument("message_id", help="Message ID (any message in the thread)")
     
     # Send command
     send_parser = subparsers.add_parser("send", help="Send an email")
@@ -509,9 +785,24 @@ def main():
             )
             display_message_list(messages)
         
+        elif args.command == "search":
+            messages = search_messages(
+                from_sender=args.from_sender,
+                to_recipient=args.to_recipient,
+                subject=args.subject,
+                body=args.body,
+                folder=args.folder,
+                limit=args.limit
+            )
+            display_message_list(messages)
+        
         elif args.command == "get":
             message = get_message(args.message_id)
             display_message(message)
+        
+        elif args.command == "thread":
+            messages = get_message_thread(args.message_id)
+            display_thread(messages)
         
         elif args.command == "send":
             send_email(
