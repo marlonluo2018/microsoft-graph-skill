@@ -5,6 +5,10 @@ description: This skill should be used when the user needs to interact with Micr
 
 # Microsoft Graph Skill
 
+## Script Execution
+
+**Always use absolute paths to execute scripts.**
+
 ## Overview
 
 This skill enables interaction with Microsoft Graph API to manage emails, calendars, and user contacts. It provides authentication via device code flow and supports comprehensive email and calendar operations with proper handling of company restrictions (e.g., 500 recipient limit per email).
@@ -15,12 +19,26 @@ This skill enables interaction with Microsoft Graph API to manage emails, calend
 
 Use the device code flow for initial login to Microsoft Graph. This is required before any API operations.
 
-**Workflow:**
-1. Call `scripts/auth.py` to initiate authentication
-2. Display the login URL and device code to the user
-3. User visits the URL and enters the code
-4. Wait for authentication completion
-5. Tokens are cached for subsequent operations
+**Commands:**
+```bash
+# Start login flow - displays URL and device code
+python scripts/auth.py --start
+
+# Complete authentication after user enters code in browser
+python scripts/auth.py --complete
+
+# Check authentication status
+python scripts/auth.py --status
+
+# Refresh expired token
+python scripts/auth.py --refresh
+
+# Logout and clear cached tokens
+python scripts/auth.py --logout
+
+# Extend current session (refresh token proactively)
+python scripts/auth.py --extend
+```
 
 **Script:** `scripts/auth.py`
 
@@ -28,26 +46,115 @@ Use the device code flow for initial login to Microsoft Graph. This is required 
 
 Comprehensive email management including read, send, reply, and forward operations.
 
-#### Read Emails
-- List messages from inbox or specific folders
-- Filter by date, sender, subject, or read status
-- Retrieve message content and attachments
+**All commands support `--json` flag for machine-readable output (place before subcommand):**
+```bash
+python scripts/email_operations.py --json list --limit 10
+python scripts/email_operations.py --json search --from "John"
+```
 
-#### Send Emails
-- Send new emails with body content
-- Support for CC and BCC recipients
-- **Important:** Company restricts each email to maximum 500 recipients (To + CC + BCC)
-- Validate recipient count before sending
+**Commands:**
 
-#### Reply to Emails
-- Reply to sender only (Reply)
-- Reply to all recipients (Reply All)
-- Include original message in reply
+#### List Emails
+```bash
+# List recent emails (default 25)
+python scripts/email_operations.py list
 
-#### Forward Emails
-- Forward emails to new recipients
-- Add optional comments
-- Support CC/BCC for forwarded messages
+# Limit number of results
+python scripts/email_operations.py list --limit 10
+
+# JSON output for AI agent
+python scripts/email_operations.py --json list --limit 10
+```
+
+#### Search Emails
+```bash
+# Search by sender name/email
+python scripts/email_operations.py search --from "John"
+
+# Search by recipient
+python scripts/email_operations.py search --to "recipient@example.com"
+
+# Search by subject
+python scripts/email_operations.py search --subject "meeting"
+
+# Search in email body/content
+python scripts/email_operations.py search --content "important"
+
+# Combine search criteria
+python scripts/email_operations.py search --from "John" --subject "report"
+
+# JSON output
+python scripts/email_operations.py --json search --from "John"
+```
+
+#### Get Email Details
+```bash
+# Get full email content by message ID
+python scripts/email_operations.py get <message_id>
+
+# JSON output
+python scripts/email_operations.py --json get <message_id>
+```
+
+#### View Email Thread
+```bash
+# View entire conversation thread
+python scripts/email_operations.py thread <message_id>
+
+# JSON output
+python scripts/email_operations.py --json thread <message_id>
+```
+
+#### Send Email
+```bash
+# Send new email
+python scripts/email_operations.py send \
+  --to "recipient@example.com" \
+  --subject "Test Subject" \
+  --body "Email body content"
+
+# With CC and BCC
+python scripts/email_operations.py send \
+  --to "recipient@example.com" \
+  --cc "cc1@example.com,cc2@example.com" \
+  --bcc "bcc@example.com" \
+  --subject "Subject" \
+  --body "Body content"
+
+# JSON output (returns message ID on success)
+python scripts/email_operations.py --json send \
+  --to "recipient@example.com" \
+  --subject "Subject" \
+  --body "Body"
+```
+
+#### Reply to Email
+```bash
+# Reply to sender only
+python scripts/email_operations.py reply <message_id> --body "Reply content"
+
+# Reply to all recipients
+python scripts/email_operations.py reply <message_id> --body "Reply content" --reply-all
+
+# JSON output
+python scripts/email_operations.py --json reply <message_id> --body "Reply content"
+```
+
+#### Forward Email
+```bash
+# Forward email to new recipient
+python scripts/email_operations.py forward <message_id> \
+  --to "recipient@example.com" \
+  --comment "FYI"
+
+# JSON output
+python scripts/email_operations.py --json forward <message_id> \
+  --to "recipient@example.com"
+```
+
+**Important Constraints:**
+- Maximum 500 recipients per email (To + CC + BCC combined)
+- Company policy restriction
 
 **Script:** `scripts/email_operations.py`
 
@@ -55,20 +162,87 @@ Comprehensive email management including read, send, reply, and forward operatio
 
 Create and manage calendar events with attendee management.
 
-#### Create Events
-- Create meetings with subject, body, and time
-- Add required and optional attendees
-- Set location (physical or online/Teams)
-- Configure reminders and recurrence
+**All commands support `--json` flag for machine-readable output (place before subcommand):**
+```bash
+python scripts/calendar_operations.py --json list --limit 10
+python scripts/calendar_operations.py --json get <event_id>
+```
 
-#### Update/Delete Events
-- Modify existing events
-- Cancel meetings
-- Send updates to attendees
+**Commands:**
 
-#### Send Emails to Attendees
-- Send meeting-related communications
-- Notify attendees of changes
+#### List Events
+```bash
+# List upcoming events (default 25)
+python scripts/calendar_operations.py list
+
+# Limit number of results
+python scripts/calendar_operations.py list --limit 10
+
+# JSON output
+python scripts/calendar_operations.py --json list --limit 10
+```
+
+#### Get Event Details
+```bash
+# Get full event details by event ID
+python scripts/calendar_operations.py get <event_id>
+
+# JSON output
+python scripts/calendar_operations.py --json get <event_id>
+```
+
+#### Create Event
+```bash
+# Create a meeting
+python scripts/calendar_operations.py create \
+  --subject "Meeting Subject" \
+  --start "2026-03-22T10:00:00" \
+  --end "2026-03-22T11:00:00"
+
+# With attendees
+python scripts/calendar_operations.py create \
+  --subject "Team Meeting" \
+  --start "2026-03-22T10:00:00" \
+  --end "2026-03-22T11:00:00" \
+  --attendees "user1@example.com,user2@example.com"
+
+# With location and body
+python scripts/calendar_operations.py create \
+  --subject "Team Meeting" \
+  --start "2026-03-22T10:00:00" \
+  --end "2026-03-22T11:00:00" \
+  --location "Conference Room A" \
+  --body "Meeting agenda:\n1. Review\n2. Discussion"
+
+# JSON output (returns event ID on success)
+python scripts/calendar_operations.py --json create \
+  --subject "Meeting" \
+  --start "2026-03-22T10:00:00" \
+  --end "2026-03-22T11:00:00"
+```
+
+#### Update Event
+```bash
+# Update event subject
+python scripts/calendar_operations.py update <event_id> --subject "New Subject"
+
+# Update event time
+python scripts/calendar_operations.py update <event_id> \
+  --start "2026-03-22T14:00:00" \
+  --end "2026-03-22T15:00:00"
+
+# JSON output
+python scripts/calendar_operations.py --json update <event_id> --subject "New Subject"
+```
+
+#### Delete Event
+```bash
+# Delete an event
+python scripts/calendar_operations.py delete <event_id>
+
+# JSON output
+python scripts/calendar_operations.py --json delete <event_id>
+```
 
 **Script:** `scripts/calendar_operations.py`
 
@@ -76,27 +250,109 @@ Create and manage calendar events with attendee management.
 
 Query attendees' availability to find suitable meeting times.
 
-**Capabilities:**
-- Check free/busy status for specified time periods
-- Query multiple attendees simultaneously
-- Get detailed availability information (free, busy, tentative, out of office)
-- Suggest optimal meeting times based on availability
+**Commands:**
 
-**Script:** `scripts/calendar_operations.py` (function: `get_availability`)
+#### Query Free/Busy Status
+```bash
+# Check availability for one or more users
+python scripts/calendar_operations.py freebusy \
+  --emails "user1@example.com,user2@example.com" \
+  --start "2026-03-22T09:00:00" \
+  --end "2026-03-22T18:00:00"
+
+# JSON output
+python scripts/calendar_operations.py --json freebusy \
+  --emails "user1@example.com,user2@example.com" \
+  --start "2026-03-22T09:00:00" \
+  --end "2026-03-22T18:00:00"
+```
+
+**Returns:**
+- Free/busy status for each time slot
+- Detailed availability information (free, busy, tentative, out of office)
+
+**Script:** `scripts/calendar_operations.py`
 
 ### 5. User/Contact Queries
 
 Search and retrieve user and contact information.
 
-#### User Queries
-- Search users by name, email, or other attributes
-- Get user profile information
-- List direct reports and manager
+**All commands support `--json` flag for machine-readable output (place before subcommand):**
+```bash
+python scripts/user_operations.py --json search "john"
+python scripts/user_operations.py --json get
+```
 
-#### Contact Queries
-- Search personal contacts
-- Get contact details
-- List contact folders
+**Commands:**
+
+#### Get Current User Info
+```bash
+# Get current authenticated user's profile
+python scripts/user_operations.py get
+
+# JSON output
+python scripts/user_operations.py --json get
+```
+
+#### Search Users
+```bash
+# Search users by name or email
+python scripts/user_operations.py search "john"
+
+# Limit number of results
+python scripts/user_operations.py search "john" --limit 10
+
+# Search by given name only (first name)
+python scripts/user_operations.py search "john" --name-only
+
+# Filter by office location or email domain (client-side filter)
+python scripts/user_operations.py search "john" --office "philippines"
+python scripts/user_operations.py search "john" --office "ph.ibm.com"
+
+# Show detailed user info
+python scripts/user_operations.py search "john" --detail
+
+# JSON output
+python scripts/user_operations.py --json search "john"
+python scripts/user_operations.py --json search "john" --name-only --office "philippines"
+```
+
+**Search Options:**
+- `--name-only`: Search only by given name (first name)
+- `--office <text>`: Filter by office location or email domain (client-side filtering)
+- `--detail`: Show detailed user information (job title, department, phone, office)
+- `--limit <n>`: Limit number of results
+
+#### Get User's Manager
+```bash
+# Get manager of a user
+python scripts/user_operations.py manager <user_id_or_email>
+
+# JSON output
+python scripts/user_operations.py --json manager <user_id>
+```
+
+#### Get Direct Reports
+```bash
+# Get direct reports of a user
+python scripts/user_operations.py reports <user_id_or_email>
+
+# JSON output
+python scripts/user_operations.py --json reports <user_id>
+```
+
+#### Find Meeting Times
+```bash
+# Find available meeting times for attendees
+python scripts/user_operations.py find-times \
+  --attendees "user1@example.com,user2@example.com" \
+  --duration 60
+
+# JSON output
+python scripts/user_operations.py --json find-times \
+  --attendees "user1@example.com,user2@example.com" \
+  --duration 60
+```
 
 **Script:** `scripts/user_operations.py`
 
@@ -105,23 +361,52 @@ Search and retrieve user and contact information.
 ```
 User Request
     │
-    ├─► Is this about email?
-    │       ├─► Read → Use email_operations.py:list_messages()
-    │       ├─► Send → Use email_operations.py:send_email()
-    │       │           └─► Validate recipient count ≤ 500
-    │       ├─► Reply → Use email_operations.py:reply_email()
-    │       └─► Forward → Use email_operations.py:forward_email()
+    ├─► Authentication needed?
+    │       ├─► Start login → python scripts/auth.py --start
+    │       ├─► Complete → python scripts/auth.py --complete
+    │       ├─► Check status → python scripts/auth.py --status
+    │       └─► Refresh → python scripts/auth.py --refresh
     │
-    ├─► Is this about calendar?
-    │       ├─► Create event → Use calendar_operations.py:create_event()
-    │       ├─► Query availability → Use calendar_operations.py:get_availability()
-    │       ├─► Update event → Use calendar_operations.py:update_event()
-    │       └─► Delete event → Use calendar_operations.py:delete_event()
+    ├─► Email operations?
+    │       ├─► List emails → python scripts/email_operations.py list
+    │       ├─► Search → python scripts/email_operations.py search --from "..."
+    │       ├─► Get details → python scripts/email_operations.py get <id>
+    │       ├─► View thread → python scripts/email_operations.py thread <id>
+    │       ├─► Send → python scripts/email_operations.py send --to "..." --subject "..." --body "..."
+    │       ├─► Reply → python scripts/email_operations.py reply <id> --body "..."
+    │       └─► Forward → python scripts/email_operations.py forward <id> --to "..."
     │
-    └─► Is this about users/contacts?
-            ├─► Search users → Use user_operations.py:search_users()
-            └─► Search contacts → Use user_operations.py:search_contacts()
+    ├─► Calendar operations?
+    │       ├─► List events → python scripts/calendar_operations.py list
+    │       ├─► Get event → python scripts/calendar_operations.py get <id>
+    │       ├─► Create → python scripts/calendar_operations.py create --subject "..." --start "..." --end "..."
+    │       ├─► Update → python scripts/calendar_operations.py update <id> --subject "..."
+    │       ├─► Delete → python scripts/calendar_operations.py delete <id>
+    │       └─► Availability → python scripts/calendar_operations.py freebusy --emails "..."
+    │
+    └─► User operations?
+            ├─► Get current user → python scripts/user_operations.py get
+            ├─► Search users → python scripts/user_operations.py search "..."
+            ├─► Get manager → python scripts/user_operations.py manager <id>
+            ├─► Get reports → python scripts/user_operations.py reports <id>
+            └─► Find times → python scripts/user_operations.py find-times --attendees "..."
 ```
+
+## JSON Output for AI Agents
+
+All scripts support `--json` flag for machine-readable output. Place `--json` BEFORE the subcommand:
+
+```bash
+# Correct placement
+python scripts/email_operations.py --json list
+python scripts/calendar_operations.py --json get <id>
+python scripts/user_operations.py --json search "john"
+
+# Incorrect (won't work)
+python scripts/email_operations.py list --json
+```
+
+JSON output returns structured data without formatting, colors, or progress messages - ideal for AI agent consumption.
 
 ## Important Constraints
 

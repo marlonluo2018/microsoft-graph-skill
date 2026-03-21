@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Microsoft Graph Email Operations Module
 
@@ -20,6 +21,11 @@ import argparse
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+
+# Fix Windows console encoding
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
 
 # Add parent directory to path for config import
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -721,6 +727,9 @@ def main():
     parser = argparse.ArgumentParser(description="Microsoft Graph Email Operations")
     subparsers = parser.add_subparsers(dest="command", required=True)
     
+    # Global --json flag
+    parser.add_argument("--json", action="store_true", help="Output in JSON format")
+    
     # List command
     list_parser = subparsers.add_parser("list", help="List messages")
     list_parser.add_argument("--folder", default="inbox", help="Folder name")
@@ -790,7 +799,10 @@ def main():
                 limit=args.limit,
                 filter_query=filter_query
             )
-            display_message_list(messages)
+            if args.json:
+                print(json.dumps({"success": True, "messages": messages, "total": len(messages)}, indent=2, default=str))
+            else:
+                display_message_list(messages)
         
         elif args.command == "search":
             messages = search_messages(
@@ -801,15 +813,24 @@ def main():
                 folder=args.folder,
                 limit=args.limit
             )
-            display_message_list(messages)
+            if args.json:
+                print(json.dumps({"success": True, "messages": messages, "total": len(messages)}, indent=2, default=str))
+            else:
+                display_message_list(messages)
         
         elif args.command == "get":
             message = get_message(args.message_id)
-            display_message(message)
+            if args.json:
+                print(json.dumps({"success": True, "message": message}, indent=2, default=str))
+            else:
+                display_message(message)
         
         elif args.command == "thread":
             messages = get_message_thread(args.message_id)
-            display_thread(messages)
+            if args.json:
+                print(json.dumps({"success": True, "messages": messages, "total": len(messages)}, indent=2, default=str))
+            else:
+                display_thread(messages)
         
         elif args.command == "send":
             send_email(
@@ -820,7 +841,10 @@ def main():
                 bcc=parse_email_list(args.bcc) if args.bcc else None,
                 body_type=args.body_type
             )
-            print("✓ Email sent successfully")
+            if args.json:
+                print(json.dumps({"success": True, "message": "Email sent successfully"}))
+            else:
+                print("✓ Email sent successfully")
         
         elif args.command == "reply":
             reply_email(
@@ -828,7 +852,10 @@ def main():
                 body=args.body,
                 reply_all=args.reply_all
             )
-            print("✓ Reply sent successfully")
+            if args.json:
+                print(json.dumps({"success": True, "message": "Reply sent successfully"}))
+            else:
+                print("✓ Reply sent successfully")
         
         elif args.command == "forward":
             forward_email(
@@ -838,25 +865,43 @@ def main():
                 bcc=parse_email_list(args.bcc) if args.bcc else None,
                 comment=args.comment
             )
-            print("✓ Email forwarded successfully")
+            if args.json:
+                print(json.dumps({"success": True, "message": "Email forwarded successfully"}))
+            else:
+                print("✓ Email forwarded successfully")
         
         elif args.command == "read":
             if args.unread:
                 mark_as_unread(args.message_id)
-                print("✓ Marked as unread")
+                if args.json:
+                    print(json.dumps({"success": True, "message": "Marked as unread"}))
+                else:
+                    print("✓ Marked as unread")
             else:
                 mark_as_read(args.message_id)
-                print("✓ Marked as read")
+                if args.json:
+                    print(json.dumps({"success": True, "message": "Marked as read"}))
+                else:
+                    print("✓ Marked as read")
         
         elif args.command == "delete":
             delete_email(args.message_id)
-            print("✓ Email deleted")
+            if args.json:
+                print(json.dumps({"success": True, "message": "Email deleted"}))
+            else:
+                print("✓ Email deleted")
     
     except ValueError as e:
-        print(f"Error: {e}")
+        if args.json:
+            print(json.dumps({"success": False, "error": str(e)}))
+        else:
+            print(f"Error: {e}")
         sys.exit(1)
     except Exception as e:
-        print(f"Error: {e}")
+        if args.json:
+            print(json.dumps({"success": False, "error": str(e)}))
+        else:
+            print(f"Error: {e}")
         sys.exit(1)
 
 

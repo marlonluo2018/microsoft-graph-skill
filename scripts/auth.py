@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Microsoft Graph Authentication Module
 
@@ -19,6 +20,11 @@ import time
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any
+
+# Fix Windows console encoding
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
 
 # Add parent directory to path for config import
 sys.path.insert(0, str(Path(__file__).parent.parent))

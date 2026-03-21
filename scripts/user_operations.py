@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Microsoft Graph User Operations Module
 
@@ -15,8 +16,14 @@ Usage:
 import os
 import sys
 import argparse
+import json
 from pathlib import Path
 from typing import List, Optional, Dict, Any
+
+# Fix Windows console encoding
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
 
 # Add parent directory to path for config import
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -49,7 +56,9 @@ def get_headers(token: str) -> Dict[str, str]:
 def search_users(
     query: str,
     limit: int = 25,
-    token: str = None
+    token: str = None,
+    search_fields: list = None,
+    office: str = None
 ) -> List[Dict[str, Any]]:
     """
     Search for users in the organization.
@@ -58,6 +67,8 @@ def search_users(
         query: Search query (name, email, etc.)
         limit: Maximum number of results
         token: Access token
+        search_fields: Fields to search in ['displayName', 'mail', 'givenName', 'surname']
+        office: Filter by office location (partial match)
     
     Returns:
         List of user objects
@@ -67,20 +78,24 @@ def search_users(
     
     url = f"{GRAPH_API_BASE}/users"
     
+    # Default search fields
+    if search_fields is None:
+        search_fields = ['displayName', 'mail', 'userPrincipalName', 'givenName', 'surname']
+    
     # Build filter for searching
-    # Search in displayName, mail, and userPrincipalName
-    filter_query = (
-        f"startsWith(displayName,'{query}') or "
-        f"startsWith(mail,'{query}') or "
-        f"startsWith(userPrincipalName,'{query}') or "
-        f"startsWith(givenName,'{query}') or "
-        f"startsWith(surname,'{query}')"
-    )
+    filter_parts = []
+    for field in search_fields:
+        filter_parts.append(f"startsWith({field},'{query}')")
+    
+    filter_query = " or ".join(filter_parts)
+    
+    # Add office filter if specified (filter by email domain after getting results)
+    office_lower = office.lower() if office else None
     
     params = {
         "$filter": filter_query,
         "$top": limit,
-        "$select": "id,displayName,mail,userPrincipalName,jobTitle,department,officeLocation,mobilePhone"
+        "$select": "id,displayName,mail,userPrincipalName,jobTitle,department,officeLocation,mobilePhone,businessPhones"
     }
     
     response = requests.get(url, headers=get_headers(token), params=params)
@@ -89,7 +104,17 @@ def search_users(
         raise Exception(f"Failed to search users: {response.status_code} - {response.text}")
     
     data = response.json()
-    return data.get("value", [])
+    users = data.get("value", [])
+    
+    # Client-side filter by office/email domain
+    if office_lower:
+        users = [
+            u for u in users
+            if office_lower in (u.get('mail') or '').lower()
+            or office_lower in (u.get('officeLocation') or '').lower()
+        ]
+    
+    return users[:limit]
 
 
 def list_users(
@@ -422,18 +447,20 @@ def get_people(
 
 def display_user_list(users: List[Dict]):
     """Display a list of users in a readable format."""
-    print(f"\n{'='*80}")
-    print(f"{'Name':<35} {'Email':<35} {'Title':<30}")
-    print(f"{'='*80}")
+    print(f"\n{'='*120}")
+    print(f"{'Name':<25} {'Email':<35} {'Title':<30} {'Office':<20} {'Phone':<18}")
+    print(f"{'='*120}")
     
     for user in users:
-        name = user.get('displayName', 'Unknown')[:35]
-        email = user.get('mail') or user.get('userPrincipalName', '')[:35]
-        title = user.get('jobTitle', '')[:30]
+        name = (user.get('displayName') or 'Unknown')[:25]
+        email = (user.get('mail') or user.get('userPrincipalName') or '')[:35]
+        title = (user.get('jobTitle') or '')[:30]
+        office = (user.get('officeLocation') or '')[:20]
+        phone = (user.get('mobilePhone') or '')[:18]
         
-        print(f"{name:<35} {email:<35} {title:<30}")
+        print(f"{name:<25} {email:<35} {title:<30} {office:<20} {phone:<18}")
     
-    print(f"{'='*80}")
+    print(f"{'='*120}")
     print(f"Total: {len(users)} users")
 
 
@@ -507,10 +534,16 @@ def main():
     parser = argparse.ArgumentParser(description="Microsoft Graph User Operations")
     subparsers = parser.add_subparsers(dest="command", required=True)
     
+    # Global --json flag
+    parser.add_argument("--json", action="store_true", help="Output in JSON format")
+    
     # Search users command
     search_parser = subparsers.add_parser("search", help="Search users")
     search_parser.add_argument("query", help="Search query")
     search_parser.add_argument("--limit", type=int, default=25, help="Max results")
+    search_parser.add_argument("--name-only", action="store_true", help="Search only by given name (first name)")
+    search_parser.add_argument("--office", help="Filter by office location (e.g., 'Philippines', 'PH')")
+    search_parser.add_argument("--detail", action="store_true", help="Show detailed information for each user")
     
     # Get user command
     get_parser = subparsers.add_parser("get", help="Get a user")
@@ -542,43 +575,67 @@ def main():
     
     try:
         if args.command == "search":
-            users = search_users(args.query, args.limit)
-            display_user_list(users)
+            search_fields = ['givenName'] if args.name_only else None
+            users = search_users(args.query, args.limit, search_fields=search_fields, office=args.office)
+            if args.json:
+                print(json.dumps({"success": True, "users": users, "total": len(users)}, indent=2, default=str))
+            elif args.detail:
+                for user in users:
+                    display_user(user)
+            else:
+                display_user_list(users)
         
         elif args.command == "get":
             if args.user_id:
                 user = get_user(args.user_id)
             else:
                 user = get_me()
-            display_user(user)
+            if args.json:
+                print(json.dumps({"success": True, "user": user}, indent=2, default=str))
+            else:
+                display_user(user)
         
         elif args.command == "manager":
             manager = get_manager(args.user_id)
-            if manager:
+            if args.json:
+                print(json.dumps({"success": True, "manager": manager}, indent=2, default=str))
+            elif manager:
                 display_user(manager)
             else:
                 print("No manager assigned.")
         
         elif args.command == "directreports":
             reports = get_direct_reports(args.user_id)
-            display_user_list(reports)
+            if args.json:
+                print(json.dumps({"success": True, "directReports": reports, "total": len(reports)}, indent=2, default=str))
+            else:
+                display_user_list(reports)
         
         elif args.command == "contacts":
             if args.query:
                 contacts = search_contacts(args.query, args.limit)
             else:
                 contacts = list_contacts(args.folder, args.limit)
-            display_contact_list(contacts)
+            if args.json:
+                print(json.dumps({"success": True, "contacts": contacts, "total": len(contacts)}, indent=2, default=str))
+            else:
+                display_contact_list(contacts)
         
         elif args.command == "people":
             people = get_people(args.query, args.limit)
-            display_user_list(people)
+            if args.json:
+                print(json.dumps({"success": True, "people": people, "total": len(people)}, indent=2, default=str))
+            else:
+                display_user_list(people)
         
         elif args.command == "folders":
             folders = list_contact_folders()
-            print(f"\nContact Folders ({len(folders)}):")
-            for f in folders:
-                print(f"  - {f.get('displayName', 'Unknown')} (ID: {f.get('id')})")
+            if args.json:
+                print(json.dumps({"success": True, "folders": folders, "total": len(folders)}, indent=2, default=str))
+            else:
+                print(f"\nContact Folders ({len(folders)}):")
+                for f in folders:
+                    print(f"  - {f.get('displayName', 'Unknown')} (ID: {f.get('id')})")
     
     except Exception as e:
         print(f"Error: {e}")

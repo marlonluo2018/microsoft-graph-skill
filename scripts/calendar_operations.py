@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Microsoft Graph Calendar Operations Module
 
@@ -21,6 +22,11 @@ import argparse
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
+
+# Fix Windows console encoding
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
 
 # Add parent directory to path for config import
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -627,6 +633,9 @@ def main():
     parser = argparse.ArgumentParser(description="Microsoft Graph Calendar Operations")
     subparsers = parser.add_subparsers(dest="command", required=True)
     
+    # Global --json flag
+    parser.add_argument("--json", action="store_true", help="Output in JSON format")
+    
     # List command
     list_parser = subparsers.add_parser("list", help="List calendar events")
     list_parser.add_argument("--calendar", help="Calendar ID")
@@ -683,11 +692,17 @@ def main():
                 end=args.end,
                 limit=args.limit
             )
-            display_event_list(events)
+            if args.json:
+                print(json.dumps({"success": True, "events": events, "total": len(events)}, indent=2, default=str))
+            else:
+                display_event_list(events)
         
         elif args.command == "get":
             event = get_event(args.event_id)
-            display_event(event)
+            if args.json:
+                print(json.dumps({"success": True, "event": event}, indent=2, default=str))
+            else:
+                display_event(event)
         
         elif args.command == "create":
             attendees = None
@@ -705,9 +720,15 @@ def main():
                 is_all_day=args.all_day,
                 is_online_meeting=args.teams
             )
-            print(f"✓ Event created: {event.get('id')}")
-            if args.teams and event.get('onlineMeeting'):
-                print(f"  Teams Link: {event['onlineMeeting'].get('joinUrl')}")
+            if args.json:
+                result = {"success": True, "event": event, "eventId": event.get('id')}
+                if args.teams and event.get('onlineMeeting'):
+                    result["teamsLink"] = event['onlineMeeting'].get('joinUrl')
+                print(json.dumps(result, indent=2, default=str))
+            else:
+                print(f"✓ Event created: {event.get('id')}")
+                if args.teams and event.get('onlineMeeting'):
+                    print(f"  Teams Link: {event['onlineMeeting'].get('joinUrl')}")
         
         elif args.command == "update":
             event = update_event(
@@ -718,11 +739,17 @@ def main():
                 body=args.body,
                 location=args.location
             )
-            print(f"✓ Event updated")
+            if args.json:
+                print(json.dumps({"success": True, "event": event}, indent=2, default=str))
+            else:
+                print(f"✓ Event updated")
         
         elif args.command == "delete":
             delete_event(args.event_id)
-            print("✓ Event deleted")
+            if args.json:
+                print(json.dumps({"success": True, "message": "Event deleted"}))
+            else:
+                print("✓ Event deleted")
         
         elif args.command == "availability":
             data = get_availability(
@@ -731,16 +758,25 @@ def main():
                 end=args.end,
                 timezone=args.timezone
             )
-            display_availability(data)
+            if args.json:
+                print(json.dumps({"success": True, "availability": data}, indent=2, default=str))
+            else:
+                display_availability(data)
         
         elif args.command == "calendars":
             calendars = list_calendars()
-            print(f"\nCalendars ({len(calendars)}):")
-            for cal in calendars:
-                print(f"  - {cal.get('name', 'Unknown')} (ID: {cal.get('id')})")
+            if args.json:
+                print(json.dumps({"success": True, "calendars": calendars, "total": len(calendars)}, indent=2, default=str))
+            else:
+                print(f"\nCalendars ({len(calendars)}):")
+                for cal in calendars:
+                    print(f"  - {cal.get('name', 'Unknown')} (ID: {cal.get('id')})")
     
     except Exception as e:
-        print(f"Error: {e}")
+        if args.json:
+            print(json.dumps({"success": False, "error": str(e)}))
+        else:
+            print(f"Error: {e}")
         sys.exit(1)
 
 

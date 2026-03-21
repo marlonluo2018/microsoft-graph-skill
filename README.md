@@ -185,6 +185,26 @@ When using the default client ID, the following delegated permissions are availa
 | `Contacts.Read` | Read user contacts |
 | `People.Read` | Read people relevant to user |
 
+## JSON Output Format
+
+All scripts support `--json` flag for machine-readable output, ideal for AI agents and automation:
+
+```bash
+# JSON output for email operations
+python scripts/email_operations.py --json list --limit 10
+python scripts/email_operations.py --json search --from "John"
+
+# JSON output for calendar operations
+python scripts/calendar_operations.py --json list --limit 10
+python scripts/calendar_operations.py --json get <event_id>
+
+# JSON output for user operations
+python scripts/user_operations.py --json search "john"
+python scripts/user_operations.py --json manager <user_id>
+```
+
+JSON output provides structured data without formatting, colors, or progress messages.
+
 ## Limitations
 
 - Maximum 500 recipients per email (company policy)
