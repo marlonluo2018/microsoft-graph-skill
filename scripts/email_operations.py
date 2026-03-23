@@ -21,6 +21,7 @@ import argparse
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # Fix Windows console encoding
 if sys.platform == 'win32':
@@ -112,16 +113,28 @@ def list_messages(
     limit: int = 25,
     filter_query: str = None,
     order_by: str = "receivedDateTime desc",
+    include_preview: bool = False,
+    inference_classification: str = None,
+    from_sender: str = None,
+    to_recipient: str = None,
+    subject: str = None,
+    body: str = None,
     token: str = None
 ) -> List[Dict[str, Any]]:
     """
-    List messages from a folder.
+    List/search messages from a folder with optional search criteria.
     
     Args:
-        folder: Folder name (inbox, sentitems, drafts, etc.) or folder ID
+        folder: Folder name (inbox, sentitems, drafts, etc.) or folder ID or 'all' for all folders
         limit: Maximum number of messages to return
         filter_query: OData filter query
         order_by: Sort order
+        include_preview: Include bodyPreview field
+        inference_classification: Filter by classification ("focused" or "other")
+        from_sender: Search by sender name or email
+        to_recipient: Search by recipient name or email
+        subject: Search by subject text
+        body: Search by body text
         token: Access token (will obtain if not provided)
     
     Returns:
@@ -130,6 +143,39 @@ def list_messages(
     if token is None:
         token = get_access_token()
     
+    # Auto-detect Chinese and English patterns and adjust parameters
+    if from_sender:
+        # English patterns
+        if any(keyword in from_sender.lower() for keyword in ["sent to", "send to", "sent"]):
+            # "sent to" means searching sent folder - switch to sent folder and use to_recipient
+            folder = "sentitems"
+            # Remove the pattern keywords (case-insensitive)
+            cleaned = from_sender
+            for keyword in ["sent to", "send to", "sent"]:
+                cleaned = cleaned.replace(keyword, "").replace(keyword.title(), "").replace(keyword.upper(), "")
+            to_recipient = cleaned.strip()
+            from_sender = None
+        elif any(keyword in from_sender.lower() for keyword in ["received from", "from", "received"]):
+            # "received from" means searching inbox - use inbox and clean keyword
+            folder = "inbox"
+            cleaned = from_sender
+            for keyword in ["received from", "from", "received"]:
+                cleaned = cleaned.replace(keyword, "").replace(keyword.title(), "").replace(keyword.upper(), "")
+            from_sender = cleaned.strip()
+        # Chinese patterns
+        elif any(keyword in from_sender for keyword in ["发给", "发送给", "发送到"]):
+            # "发给" means "sent to" - switch to sent folder and use to_recipient
+            folder = "sentitems"
+            to_recipient = from_sender.replace("发给", "").replace("发送给", "").replace("发送到", "").strip()
+            from_sender = None
+        elif any(keyword in from_sender for keyword in ["收到", "来自", "从"]):
+            # "收到/来自" means "received from" - use inbox and clean keyword
+            folder = "inbox"
+            from_sender = from_sender.replace("收到", "").replace("来自", "").replace("从", "").strip()
+    
+    # Check if search criteria provided
+    has_search_criteria = any([from_sender, to_recipient, subject, body])
+    
     # Map common folder names to well-known folder IDs
     folder_map = {
         "inbox": "inbox",
@@ -143,17 +189,54 @@ def list_messages(
         "outbox": "outbox"
     }
     
-    folder_id = folder_map.get(folder.lower(), folder)
+    # Build URL based on folder
+    if folder.lower() == "all":
+        url = f"{GRAPH_API_BASE}/me/messages"
+    else:
+        folder_id = folder_map.get(folder.lower(), folder)
+        url = f"{GRAPH_API_BASE}/me/mailFolders/{folder_id}/messages"
     
-    url = f"{GRAPH_API_BASE}/me/mailFolders/{folder_id}/messages"
+    # Build select fields
+    select_fields = "id,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,hasAttachments,inferenceClassification"
+    if include_preview:
+        select_fields += ",bodyPreview"
+    
+    # Build parameters
     params = {
-        "$top": limit,
-        "$orderby": order_by,
-        "$select": "id,subject,from,toRecipients,receivedDateTime,isRead,hasAttachments"
+        "$select": select_fields
     }
     
+    # If search criteria provided, use $search
+    if has_search_criteria:
+        search_keywords = []
+        if from_sender:
+            search_keywords.append(from_sender)
+        if to_recipient:
+            search_keywords.append(to_recipient)
+        if subject:
+            search_keywords.append(subject)
+        if body:
+            search_keywords.append(body)
+        
+        search_query = " ".join(search_keywords)
+        params["$search"] = f'"{search_query}"'
+        params["$top"] = min(limit * 3, 100)  # Get more for client-side filtering
+    else:
+        params["$top"] = limit
+        params["$orderby"] = order_by
+    
+    # Build filter query
+    filters = []
     if filter_query:
-        params["$filter"] = filter_query
+        filters.append(filter_query)
+    
+    if inference_classification:
+        classification = inference_classification.lower()
+        if classification in ["focused", "other"]:
+            filters.append(f"inferenceClassification eq '{classification}'")
+    
+    if filters:
+        params["$filter"] = " and ".join(filters)
     
     response = requests.get(url, headers=get_headers(token), params=params)
     
@@ -161,125 +244,42 @@ def list_messages(
         raise Exception(f"Failed to list messages: {response.status_code} - {response.text}")
     
     data = response.json()
-    return data.get("value", [])
-
-
-# =============================================================================
-# SEARCH MESSAGES
-# =============================================================================
-
-def search_messages(
-    from_sender: str = None,
-    to_recipient: str = None,
-    subject: str = None,
-    body: str = None,
-    folder: str = "inbox",
-    limit: int = 25,
-    token: str = None
-) -> List[Dict[str, Any]]:
-    """
-    Search messages by various criteria.
-    
-    Uses $search for initial filtering, then applies client-side filtering
-    for more specific criteria like sender name matching.
-    
-    Args:
-        from_sender: Sender name or email to search for
-        to_recipient: Recipient name or email to search for
-        subject: Subject contains this text
-        body: Body contains this text
-        folder: Folder name or 'all' for all folders
-        limit: Maximum number of messages to return
-        token: Access token
-    
-    Returns:
-        List of message objects
-    """
-    if token is None:
-        token = get_access_token()
-    
-    # Build search keywords (for $search parameter)
-    search_keywords = []
-    if from_sender:
-        search_keywords.append(from_sender)
-    if to_recipient:
-        search_keywords.append(to_recipient)
-    if subject:
-        search_keywords.append(subject)
-    if body:
-        search_keywords.append(body)
-    
-    # Map common folder names to well-known folder IDs
-    folder_map = {
-        "inbox": "inbox",
-        "sent": "sentitems",
-        "sentitems": "sentitems",
-        "drafts": "drafts",
-        "deleted": "deleteditems",
-        "deleteditems": "deleteditems",
-        "junk": "junkemail",
-        "junkemail": "junkemail",
-        "outbox": "outbox"
-    }
-    
-    if folder.lower() == "all":
-        url = f"{GRAPH_API_BASE}/me/messages"
-    else:
-        folder_id = folder_map.get(folder.lower(), folder)
-        url = f"{GRAPH_API_BASE}/me/mailFolders/{folder_id}/messages"
-    
-    # Use $search if we have keywords, otherwise just list
-    if search_keywords:
-        search_query = " ".join(search_keywords)
-        params = {
-            "$search": f'"{search_query}"',
-            "$top": min(limit * 3, 100),  # Get more results for client-side filtering
-            "$select": "id,subject,from,toRecipients,receivedDateTime,isRead,hasAttachments"
-        }
-    else:
-        params = {
-            "$top": limit,
-            "$select": "id,subject,from,toRecipients,receivedDateTime,isRead,hasAttachments",
-            "$orderby": "receivedDateTime desc"
-        }
-    
-    response = requests.get(url, headers=get_headers(token), params=params)
-    
-    if response.status_code != 200:
-        raise Exception(f"Failed to search messages: {response.status_code} - {response.text}")
-    
-    data = response.json()
     messages = data.get("value", [])
     
-    # Apply client-side filtering for more precise matching
-    if from_sender:
-        from_lower = from_sender.lower()
-        messages = [
-            m for m in messages
-            if from_lower in m.get('from', {}).get('emailAddress', {}).get('name', '').lower()
-            or from_lower in m.get('from', {}).get('emailAddress', {}).get('address', '').lower()
-        ]
+    # Apply client-side filtering for precise search matching
+    if has_search_criteria:
+        if from_sender:
+            from_lower = from_sender.lower()
+            messages = [
+                m for m in messages
+                if from_lower in m.get('from', {}).get('emailAddress', {}).get('name', '').lower()
+                or from_lower in m.get('from', {}).get('emailAddress', {}).get('address', '').lower()
+            ]
+        
+        if to_recipient:
+            to_lower = to_recipient.lower()
+            messages = [
+                m for m in messages
+                if any(
+                    to_lower in r.get('emailAddress', {}).get('name', '').lower()
+                    or to_lower in r.get('emailAddress', {}).get('address', '').lower()
+                    for r in m.get('toRecipients', [])
+                )
+            ]
+        
+        if subject:
+            subject_lower = subject.lower()
+            messages = [
+                m for m in messages
+                if subject_lower in m.get('subject', '').lower()
+            ]
+        
+        # Limit results after filtering
+        messages = messages[:limit]
     
-    if to_recipient:
-        to_lower = to_recipient.lower()
-        messages = [
-            m for m in messages
-            if any(
-                to_lower in r.get('emailAddress', {}).get('name', '').lower()
-                or to_lower in r.get('emailAddress', {}).get('address', '').lower()
-                for r in m.get('toRecipients', [])
-            )
-        ]
-    
-    if subject:
-        subject_lower = subject.lower()
-        messages = [
-            m for m in messages
-            if subject_lower in m.get('subject', '').lower()
-        ]
-    
-    # Limit results
-    return messages[:limit]
+    return messages
+
+
 
 
 # =============================================================================
@@ -381,6 +381,59 @@ def send_email(
 
 
 # =============================================================================
+# HELPER: FORMAT EMAIL AS HTML
+# =============================================================================
+
+def format_email_as_html(message: Dict[str, Any]) -> str:
+    """
+    Format an email message as HTML for inclusion in reply/forward.
+    
+    Args:
+        message: Message object from Graph API
+    
+    Returns:
+        HTML string with formatted email
+    """
+    from_addr = message.get('from', {}).get('emailAddress', {})
+    from_name = from_addr.get('name', '')
+    from_email = from_addr.get('address', '')
+    
+    to_recipients = message.get('toRecipients', [])
+    to_list = ', '.join([f"{r.get('emailAddress', {}).get('name', '')} <{r.get('emailAddress', {}).get('address', '')}>"
+                         for r in to_recipients])
+    
+    cc_recipients = message.get('ccRecipients', [])
+    cc_list = ', '.join([f"{r.get('emailAddress', {}).get('name', '')} <{r.get('emailAddress', {}).get('address', '')}>"
+                         for r in cc_recipients]) if cc_recipients else None
+    
+    subject = message.get('subject', '(No Subject)')
+    date = message.get('receivedDateTime', '')
+    
+    # Get body content
+    body_obj = message.get('body', {})
+    body_content = body_obj.get('content', '')
+    body_type = body_obj.get('contentType', 'text')
+    
+    # If body is text, convert to HTML
+    if body_type == 'text':
+        body_content = body_content.replace('\n', '<br>')
+    
+    # Build HTML
+    html = f"""<hr>
+<p><strong>From:</strong> {from_name} <{from_email}><br>
+<strong>Sent:</strong> {date}<br>
+<strong>To:</strong> {to_list}<br>"""
+    
+    if cc_list:
+        html += f"<strong>Cc:</strong> {cc_list}<br>"
+    
+    html += f"""<strong>Subject:</strong> {subject}</p>
+{body_content}"""
+    
+    return html
+
+
+# =============================================================================
 # REPLY TO EMAIL
 # =============================================================================
 
@@ -389,16 +442,18 @@ def reply_email(
     body: str,
     reply_all: bool = False,
     body_type: str = "html",
+    include_history: bool = True,
     token: str = None
 ) -> bool:
     """
-    Reply to an email.
+    Reply to an email with conversation history included in body.
     
     Args:
         message_id: ID of message to reply to
         body: Reply body content
         reply_all: If True, reply to all recipients; otherwise reply to sender only
         body_type: "html" or "text"
+        include_history: If True, include original message in reply body (default: True)
         token: Access token
     
     Returns:
@@ -407,24 +462,77 @@ def reply_email(
     if token is None:
         token = get_access_token()
     
-    endpoint = "replyAll" if reply_all else "reply"
-    url = f"{GRAPH_API_BASE}/me/messages/{message_id}/{endpoint}"
+    # Get original message
+    original_msg = get_message(message_id, token)
     
-    payload = {
-        "message": {
-            "body": {
-                "contentType": body_type,
-                "content": body
-            }
-        }
-    }
+    # Check if replying to self-sent email
+    from_addr = original_msg.get('from', {}).get('emailAddress', {})
+    my_email = get_my_email(token)
     
-    response = requests.post(url, headers=get_headers(token), json=payload)
+    if from_addr.get('address', '').lower() == my_email.lower():
+        print("⚠️  WARNING: You are replying to your own sent email.")
+        print("💡 TIP: Use 'forward' command instead to forward your sent email to others.")
+        print("   Example: forward <message_id> --to \"recipient@example.com\"")
+        print()
     
-    if response.status_code != 202:
-        raise Exception(f"Failed to reply to email: {response.status_code} - {response.text}")
+    # Determine recipients
+    from_addr = original_msg.get('from', {}).get('emailAddress', {})
+    to_recipients = [from_addr.get('address')]
+    cc_recipients = []
     
-    return True
+    if reply_all:
+        # Add all original To recipients (except current user)
+        my_email = get_my_email(token)
+        for recipient in original_msg.get('toRecipients', []):
+            email = recipient.get('emailAddress', {}).get('address', '')
+            if email and email.lower() != my_email.lower() and email not in to_recipients:
+                to_recipients.append(email)
+        
+        # Add all original CC recipients
+        for recipient in original_msg.get('ccRecipients', []):
+            email = recipient.get('emailAddress', {}).get('address', '')
+            if email and email.lower() != my_email.lower():
+                cc_recipients.append(email)
+    
+    # Build email body with history
+    if include_history and body_type == "html":
+        # Convert plain text body to HTML if needed
+        if not body.strip().startswith('<'):
+            body = body.replace('\n', '<br>\n')
+        
+        full_body = body + "\n\n" + format_email_as_html(original_msg)
+    else:
+        full_body = body
+    
+    # Get subject with RE: prefix
+    subject = original_msg.get('subject', '')
+    if not subject.upper().startswith('RE:'):
+        subject = f"RE: {subject}"
+    
+    # Send email using send_email function
+    return send_email(
+        to=to_recipients,
+        subject=subject,
+        body=full_body,
+        cc=cc_recipients if cc_recipients else None,
+        body_type=body_type,
+        token=token
+    )
+
+
+def get_my_email(token: str = None) -> str:
+    """Get current user's email address."""
+    if token is None:
+        token = get_access_token()
+    
+    url = f"{GRAPH_API_BASE}/me"
+    response = requests.get(url, headers=get_headers(token))
+    
+    if response.status_code != 200:
+        return ""
+    
+    data = response.json()
+    return data.get('mail', '') or data.get('userPrincipalName', '')
 
 
 # =============================================================================
@@ -437,17 +545,22 @@ def forward_email(
     cc: List[str] = None,
     bcc: List[str] = None,
     comment: str = "",
+    body_type: str = "html",
+    include_history: bool = True,
     token: str = None
 ) -> bool:
     """
-    Forward an email.
+    Forward an email with original message and attachments included.
+    Uses Microsoft Graph's native forward API to preserve attachments.
     
     Args:
         message_id: ID of message to forward
         to: List of To recipient emails
         cc: List of CC recipient emails
         bcc: List of BCC recipient emails
-        comment: Optional comment to add
+        comment: Optional comment to add at the top
+        body_type: "html" or "text"
+        include_history: If True, include original message in body (default: True)
         token: Access token
     
     Returns:
@@ -459,18 +572,41 @@ def forward_email(
     # Validate recipients
     validate_recipients(to, cc, bcc)
     
+    # Use Microsoft Graph's native forward endpoint to preserve attachments
     url = f"{GRAPH_API_BASE}/me/messages/{message_id}/forward"
     
+    # Build recipient lists
+    to_recipients = [{"emailAddress": {"address": email}} for email in to]
+    cc_recipients = [{"emailAddress": {"address": email}} for email in (cc or [])]
+    bcc_recipients = [{"emailAddress": {"address": email}} for email in (bcc or [])]
+    
+    # Convert plain text comment to HTML if needed
+    # Graph API forward expects HTML in comment field
+    if comment:
+        if body_type == "html" and not comment.strip().startswith('<'):
+            # Convert plain text to HTML with proper line breaks
+            comment = comment.replace('\n', '<br>\n')
+            # Wrap in HTML body tags for proper rendering
+            comment = f"<html><body>{comment}</body></html>"
+        elif body_type == "text":
+            # For text, just use as-is
+            pass
+    
+    # Build payload for Graph API forward
     payload = {
-        "toRecipients": [format_email_address(e) for e in to],
-        "ccRecipients": [format_email_address(e) for e in (cc or [])],
-        "bccRecipients": [format_email_address(e) for e in (bcc or [])],
-        "comment": comment
+        "toRecipients": to_recipients,
+        "comment": comment or ""
     }
     
+    if cc_recipients:
+        payload["ccRecipients"] = cc_recipients
+    if bcc_recipients:
+        payload["bccRecipients"] = bcc_recipients
+    
+    # Send forward request
     response = requests.post(url, headers=get_headers(token), json=payload)
     
-    if response.status_code != 202:
+    if response.status_code not in [200, 201, 202]:
         raise Exception(f"Failed to forward email: {response.status_code} - {response.text}")
     
     return True
@@ -654,40 +790,102 @@ def delete_email(message_id: str, token: str = None) -> bool:
 # DISPLAY HELPERS
 # =============================================================================
 
-def display_message_list(messages: List[Dict]):
+def display_message_list(messages: List[Dict], show_preview: bool = True):
     """Display a list of messages in a readable format."""
-    print(f"\n{'='*80}")
-    print(f"{'Date':<25} {'From':<30} {'Subject':<40}")
-    print(f"{'='*80}")
-    
-    for msg in messages:
-        received = msg.get('receivedDateTime', '')
-        if received:
-            dt = datetime.fromisoformat(received.replace('Z', '+00:00'))
-            received = dt.strftime('%Y-%m-%d %H:%M')
+    if not show_preview:
+        # Compact table format without preview
+        print(f"\n{'='*100}")
+        print(f"{'Date':<20} {'From':<25} {'Subject':<30} {'ID':<15}")
+        print(f"{'='*100}")
+
+        for msg in messages:
+            received = msg.get('receivedDateTime', '')
+            if received:
+                dt = datetime.fromisoformat(received.replace('Z', '+00:00'))
+                # Convert to Asia/Shanghai timezone
+                dt_local = dt.astimezone(ZoneInfo('Asia/Shanghai'))
+                received = dt_local.strftime('%Y-%m-%d %H:%M')
+
+            from_addr = msg.get('from', {}).get('emailAddress', {})
+            sender = from_addr.get('name', from_addr.get('address', 'Unknown'))
+
+            subject = msg.get('subject', '(No Subject)')[:30]
+            read_status = '' if msg.get('isRead', True) else '[UNREAD]'
+            message_id = msg.get('id', '')[:15]
+
+            print(f"{received:<20} {sender:<25} {subject}{read_status:<{30 - len(read_status)}} {message_id:<15}")
+
+        print(f"{'='*100}")
+        print(f"Total: {len(messages)} messages")
+        print(f"💡 Tip: Use 'get <ID>' to view full email content")
+    else:
+        # Detailed format with preview
+        print(f"\n{'='*80}")
+        for i, msg in enumerate(messages, 1):
+            received = msg.get('receivedDateTime', '')
+            if received:
+                dt = datetime.fromisoformat(received.replace('Z', '+00:00'))
+                # Convert to Asia/Shanghai timezone
+                dt_local = dt.astimezone(ZoneInfo('Asia/Shanghai'))
+                received = dt_local.strftime('%Y-%m-%d %H:%M')
+
+            from_addr = msg.get('from', {}).get('emailAddress', {})
+            sender = from_addr.get('name', from_addr.get('address', 'Unknown'))
+
+            subject = msg.get('subject', '(No Subject)')
+            read_status = '[UNREAD] ' if not msg.get('isRead', True) else ''
+            message_id = msg.get('id', '')
+
+            print(f"\n{i}. {read_status}{subject}")
+            print(f"   From: {sender}")
+            print(f"   Date: {received}")
+            print(f"   ID: {message_id}")
+            
+            # Show To recipients
+            to_recipients = msg.get('toRecipients', [])
+            if to_recipients:
+                to_names = [r.get('emailAddress', {}).get('name', r.get('emailAddress', {}).get('address', '')) for r in to_recipients]
+                to_display = ', '.join(to_names[:3])  # Show first 3 recipients
+                if len(to_recipients) > 3:
+                    to_display += f' (+{len(to_recipients) - 3} more)'
+                print(f"   To: {to_display}")
+            
+            # Show CC recipients
+            cc_recipients = msg.get('ccRecipients', [])
+            if cc_recipients:
+                cc_names = [r.get('emailAddress', {}).get('name', r.get('emailAddress', {}).get('address', '')) for r in cc_recipients]
+                cc_display = ', '.join(cc_names[:3])  # Show first 3 recipients
+                if len(cc_recipients) > 3:
+                    cc_display += f' (+{len(cc_recipients) - 3} more)'
+                print(f"   Cc: {cc_display}")
+            
+            # Show preview if available
+            preview = msg.get('bodyPreview', '')
+            if preview:
+                # Limit preview to 150 characters
+                preview = preview[:150].replace('\n', ' ').replace('\r', ' ')
+                if len(msg.get('bodyPreview', '')) > 150:
+                    preview += '...'
+                print(f"   Preview: {preview}")
+            
+            if i < len(messages):
+                print(f"   {'-'*78}")
         
-        from_addr = msg.get('from', {}).get('emailAddress', {})
-        sender = from_addr.get('name', from_addr.get('address', 'Unknown'))
-        
-        subject = msg.get('subject', '(No Subject)')[:40]
-        read_status = '' if msg.get('isRead', True) else '[UNREAD]'
-        
-        print(f"{received:<25} {sender:<30} {subject}{read_status}")
-    
-    print(f"{'='*80}")
-    print(f"Total: {len(messages)} messages")
+        print(f"\n{'='*80}")
+        print(f"Total: {len(messages)} messages")
 
 
 def display_message(message: Dict):
     """Display a single message in detail."""
     import re
-    
+
     print(f"\n{'='*80}")
     print(f"Subject: {message.get('subject', '(No Subject)')}")
     print(f"From: {message.get('from', {}).get('emailAddress', {})}")
     print(f"To: {[r.get('emailAddress', {}) for r in message.get('toRecipients', [])]}")
     print(f"CC: {[r.get('emailAddress', {}) for r in message.get('ccRecipients', [])]}")
     print(f"Date: {message.get('receivedDateTime', '')}")
+    print(f"ID: {message.get('id', '')}")
     print(f"{'='*80}")
     
     # Get body content
@@ -730,21 +928,43 @@ def main():
     # Global --json flag
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
     
-    # List command
-    list_parser = subparsers.add_parser("list", help="List messages")
-    list_parser.add_argument("--folder", default="inbox", help="Folder name")
-    list_parser.add_argument("--limit", type=int, default=25, help="Max messages to return")
+    # List command (now includes search functionality)
+    list_parser = subparsers.add_parser("list", help="List/search messages")
+    list_parser.add_argument("--folder", default="inbox", help="Folder name (or 'all' for all folders)")
+    list_parser.add_argument("--limit", "--top", type=int, default=25, dest="limit", help="Max messages to return (--top is alias)")
     list_parser.add_argument("--filter", dest="filter_query", help="OData filter query")
     list_parser.add_argument("--unread", action="store_true", help="Show unread only")
+    list_parser.add_argument("--preview", action="store_true", help="Show email body preview")
+    list_parser.add_argument("--focused", action="store_true", help="Show Focused inbox only")
+    list_parser.add_argument("--other", action="store_true", help="Show Other inbox only")
+    # Search parameters
+    list_parser.add_argument("--from", dest="from_sender", help="Search by sender name or email")
+    list_parser.add_argument("--to", dest="to_recipient", help="Search by recipient name or email")
+    list_parser.add_argument("--subject", help="Search by subject text")
+    list_parser.add_argument("--body", help="Search by body text")
     
-    # Search command
-    search_parser = subparsers.add_parser("search", help="Search messages")
-    search_parser.add_argument("--from", dest="from_sender", help="Sender name or email")
-    search_parser.add_argument("--to", dest="to_recipient", help="Recipient name or email")
-    search_parser.add_argument("--subject", help="Subject contains")
-    search_parser.add_argument("--body", help="Body contains")
+    # Search command (complete alias for list, supports all parameters)
+    search_parser = subparsers.add_parser("search", help="Search/list messages (alias for list)")
     search_parser.add_argument("--folder", default="inbox", help="Folder name (or 'all' for all folders)")
-    search_parser.add_argument("--limit", type=int, default=25, help="Max messages to return")
+    search_parser.add_argument("--limit", "--top", type=int, default=25, dest="limit", help="Max messages to return (--top is alias)")
+    search_parser.add_argument("--filter", dest="filter_query", help="OData filter query")
+    search_parser.add_argument("--unread", action="store_true", help="Show unread only")
+    search_parser.add_argument("--preview", action="store_true", help="Show email body preview")
+    search_parser.add_argument("--focused", action="store_true", help="Show Focused inbox only")
+    search_parser.add_argument("--other", action="store_true", help="Show Other inbox only")
+    # Search parameters
+    search_parser.add_argument("--from", dest="from_sender", help="Search by sender name or email")
+    search_parser.add_argument("--to", dest="to_recipient", help="Search by recipient name or email")
+    search_parser.add_argument("--subject", help="Search by subject text")
+    search_parser.add_argument("--body", help="Search by body text")
+    
+    # Find command (search + display first result)
+    find_parser = subparsers.add_parser("find", help="Find and display a message (combines search + get)")
+    find_parser.add_argument("--from", dest="from_sender", help="Sender name or email")
+    find_parser.add_argument("--to", dest="to_recipient", help="Recipient name or email")
+    find_parser.add_argument("--subject", help="Subject contains")
+    find_parser.add_argument("--body", help="Body contains")
+    find_parser.add_argument("--folder", default="inbox", help="Folder name (or 'all' for all folders)")
     
     # Get command
     get_parser = subparsers.add_parser("get", help="Get a message")
@@ -789,34 +1009,77 @@ def main():
     args = parser.parse_args()
     
     try:
-        if args.command == "list":
+        if args.command in ["list", "search"]:
+            # Unified handler for list and search commands (identical functionality)
             filter_query = args.filter_query
             if args.unread:
                 filter_query = (filter_query + " and " if filter_query else "") + "isRead eq false"
             
+            # Determine inference classification
+            inference_classification = None
+            if args.focused:
+                inference_classification = "focused"
+            elif args.other:
+                inference_classification = "other"
+            
             messages = list_messages(
                 folder=args.folder,
                 limit=args.limit,
-                filter_query=filter_query
+                filter_query=filter_query,
+                include_preview=True,  # Always include bodyPreview in API response for flexibility
+                inference_classification=inference_classification,
+                from_sender=getattr(args, 'from_sender', None),
+                to_recipient=getattr(args, 'to_recipient', None),
+                subject=getattr(args, 'subject', None),
+                body=getattr(args, 'body', None)
             )
             if args.json:
                 print(json.dumps({"success": True, "messages": messages, "total": len(messages)}, indent=2, default=str))
             else:
-                display_message_list(messages)
+                display_message_list(messages, show_preview=True)
         
-        elif args.command == "search":
-            messages = search_messages(
-                from_sender=args.from_sender,
-                to_recipient=args.to_recipient,
-                subject=args.subject,
-                body=args.body,
-                folder=args.folder,
-                limit=args.limit
-            )
-            if args.json:
-                print(json.dumps({"success": True, "messages": messages, "total": len(messages)}, indent=2, default=str))
-            else:
-                display_message_list(messages)
+        elif args.command == "find":
+            # Find uses list_messages with limit=1
+            try:
+                messages = list_messages(
+                    folder=args.folder,
+                    limit=1,
+                    from_sender=args.from_sender,
+                    to_recipient=args.to_recipient,
+                    subject=args.subject,
+                    body=args.body
+                )
+                if not messages:
+                    print("No matching messages found.")
+                    sys.exit(1)
+                
+                # Get full message details
+                message = get_message(messages[0]['id'])
+                if args.json:
+                    print(json.dumps({"success": True, "message": message}, indent=2, default=str))
+                else:
+                    display_message(message)
+            except Exception as e:
+                # Auto-fallback to list --preview if find fails (e.g., due to search indexing delays)
+                if "search" in str(e).lower() or "index" in str(e).lower():
+                    print("⚠️  Search API failed (likely due to indexing delays)")
+                    print("💡 Auto-falling back to list --preview...")
+                    print()
+                    messages = list_messages(
+                        folder=args.folder,
+                        limit=10,
+                        from_sender=args.from_sender,
+                        to_recipient=args.to_recipient,
+                        subject=args.subject,
+                        body=args.body,
+                        include_preview=True
+                    )
+                    if args.json:
+                        print(json.dumps({"success": True, "messages": messages, "total": len(messages)}, indent=2, default=str))
+                    else:
+                        display_message_list(messages, show_preview=True)
+                else:
+                    raise
         
         elif args.command == "get":
             message = get_message(args.message_id)

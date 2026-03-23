@@ -84,8 +84,17 @@ def search_users(
     
     # Build filter for searching
     filter_parts = []
+    
+    # Check if query looks like an email address
+    is_email = '@' in query
+    
     for field in search_fields:
-        filter_parts.append(f"startsWith({field},'{query}')")
+        if is_email and field in ['mail', 'userPrincipalName']:
+            # For email fields, use exact match or contains
+            filter_parts.append(f"{field} eq '{query}'")
+        else:
+            # For name fields, use startsWith
+            filter_parts.append(f"startsWith({field},'{query}')")
     
     filter_query = " or ".join(filter_parts)
     

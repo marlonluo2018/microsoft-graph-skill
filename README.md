@@ -4,12 +4,14 @@ A comprehensive Python skill for interacting with Microsoft Graph API, providing
 
 ## Features
 
-- **Authentication**: OAuth2 device code flow with automatic token refresh
+- **Authentication**: OAuth2 device code flow with automatic token refresh and robust error handling
 - **Email Operations**: Read, send, reply, forward emails with CC/BCC support
 - **Email Search**: Search emails by sender, recipient, subject, or content
+- **Email Find**: One-step find and display specific email (combines search + get)
 - **Email Threads**: View complete conversation threads
+- **Smart Pattern Detection**: Auto-detect natural language patterns (e.g., "sent to X", "发给 X")
 - **Calendar Management**: Create, update, delete events; query free/busy time
-- **User Operations**: Search users, get manager/direct reports, find meeting times
+- **User Operations**: Search users, get manager/direct reports, contacts, and suggested people
 
 ## Installation
 
@@ -33,18 +35,30 @@ python scripts/auth.py --complete
 
 # Logout
 python scripts/auth.py --logout
+
+# Verbose mode for debugging
+python scripts/auth.py --status --verbose
 ```
 
 **Note:** Tokens auto-refresh via `--status`. Manual `--refresh` is optional.
 
+**Robustness Features:**
+- Automatic cleanup of expired device flows
+- Network operations retry (3 attempts) with backoff
+- Thread-safe token operations
+- Comprehensive logging to `~/.ms_graph_skill/auth.log`
+
 ### 2. Email Operations
 
 ```bash
-# List recent emails
+# List recent emails (preview is automatic)
 python scripts/email_operations.py list --limit 10
 
 # Search emails from a sender
 python scripts/email_operations.py search --from "John"
+
+# Find and display specific email (ONE-STEP: search + display full content)
+python scripts/email_operations.py find --from "sender@example.com" --subject "keyword"
 
 # Get email details
 python scripts/email_operations.py get <message_id>
@@ -61,11 +75,17 @@ python scripts/email_operations.py send \
 # Reply to email
 python scripts/email_operations.py reply <message_id> --body "Reply content"
 
-# Forward email
+# Forward email (preserves attachments)
 python scripts/email_operations.py forward <message_id> \
   --to "recipient@example.com" \
   --comment "FYI"
 ```
+
+**Smart Pattern Detection:**
+The email operations automatically detect natural language patterns:
+- English: "sent to X", "received from X"
+- Chinese: "发给 X", "收到/来自 X"
+- Example: `--from "sent to john@example.com"` → searches sent folder for emails to john@example.com
 
 ### 3. Calendar Operations
 
@@ -96,16 +116,38 @@ python scripts/calendar_operations.py freebusy \
 # Get current user info
 python scripts/user_operations.py get
 
+# Get specific user info
+python scripts/user_operations.py get <user_id_or_email>
+
 # Search users
 python scripts/user_operations.py search "john"
+
+# Search with detailed output
+python scripts/user_operations.py search "john" --detail
+
+# Search by first name only
+python scripts/user_operations.py search "john" --name-only
+
+# Filter by office location
+python scripts/user_operations.py search "john" --office "Philippines"
 
 # Get user's manager
 python scripts/user_operations.py manager <user_id>
 
-# Find meeting times
-python scripts/user_operations.py find-times \
-  --attendees "user1@example.com,user2@example.com" \
-  --duration 60
+# Get direct reports
+python scripts/user_operations.py directreports <user_id>
+
+# Get suggested people
+python scripts/user_operations.py people --search "john"
+
+# List contacts
+python scripts/user_operations.py contacts --limit 10
+
+# Search contacts
+python scripts/user_operations.py contacts --search "john"
+
+# List contact folders
+python scripts/user_operations.py folders
 ```
 
 ## Configuration
