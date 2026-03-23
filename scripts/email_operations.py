@@ -18,6 +18,7 @@ import os
 import sys
 import json
 import argparse
+import csv
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from datetime import datetime
@@ -63,14 +64,14 @@ def validate_recipients(to: List[str], cc: List[str] = None, bcc: List[str] = No
     Validate that total recipients don't exceed company limit.
     
     Args:
-        to: List of To recipients
+        to: List of To recipients (can be None)
         cc: List of CC recipients
         bcc: List of BCC recipients
     
     Returns:
         bool: True if valid, raises ValueError otherwise
     """
-    total = len(to) + len(cc or []) + len(bcc or [])
+    total = len(to or []) + len(cc or []) + len(bcc or [])
     
     if total > MAX_RECIPIENTS:
         raise ValueError(
@@ -347,6 +348,10 @@ def send_email(
     if token is None:
         token = get_access_token()
     
+    # If no To recipients but has BCC/CC, set current user as To (Graph API requires To)
+    if not to and (bcc or cc):
+        to = [get_my_email(token)]
+    
     # Validate recipients
     validate_recipients(to, cc, bcc)
     
@@ -357,7 +362,7 @@ def send_email(
             "contentType": body_type,
             "content": body
         },
-        "toRecipients": [format_email_address(e) for e in to],
+        "toRecipients": [format_email_address(e) for e in (to or [])],
         "ccRecipients": [format_email_address(e) for e in (cc or [])],
         "bccRecipients": [format_email_address(e) for e in (bcc or [])]
     }
@@ -384,6 +389,194 @@ def send_email(
         raise Exception(f"Failed to send email: {response.status_code} - {response.text}")
     
     return True
+
+
+def batch_send_email(
+    to: List[str],
+    subject: str,
+    body: str,
+    cc: List[str] = None,
+    bcc: List[str] = None,
+    csv_path: str = None,
+    email_column: str = None,
+    body_type: str = "html",
+    attachments: List[Dict] = None,
+    importance: str = None,
+    token: str = None
+) -> Dict[str, Any]:
+    """
+    Send an email to multiple recipients with automatic batching.
+    
+    When total recipients exceed MAX_RECIPIENTS_PER_EMAIL (500),
+    automatically splits them into multiple batches and sends multiple emails.
+    
+    BCC recipients can be loaded from a CSV file for mass mailing.
+    
+    Args:
+        to: List of To recipient emails
+        subject: Email subject
+        body: Email body content
+        cc: List of CC recipient emails
+        bcc: List of BCC recipient emails
+        csv_path: Path to CSV file containing BCC email addresses
+        email_column: Column name in CSV for email addresses (auto-detect if not specified)
+        body_type: "html" or "text"
+        attachments: List of attachment objects
+        importance: "low", "normal", or "high"
+        token: Access token
+    
+    Returns:
+        Dictionary with batch processing results
+    """
+    if token is None:
+        token = get_access_token()
+    
+    # Get BCC recipients from CSV if provided
+    if csv_path:
+        print(f"📖 Reading BCC recipients from CSV: {csv_path}")
+        csv_bcc = read_recipients_from_csv(csv_path, email_column)
+        print(f"✓ Found {len(csv_bcc)} BCC recipients in CSV")
+        # Merge with any manually specified BCC
+        bcc = (bcc or []) + csv_bcc
+    
+    # Calculate total recipients
+    to_count = len(to) if to else 0
+    cc_count = len(cc) if cc else 0
+    bcc_count = len(bcc) if bcc else 0
+    total_recipients = to_count + cc_count + bcc_count
+    
+    # If within limit, use regular send_email
+    if total_recipients <= MAX_RECIPIENTS:
+        send_email(to, subject, body, cc, bcc, body_type, attachments, True, importance, token)
+        return {
+            "success": True,
+            "message": "Email sent successfully",
+            "total_recipients": total_recipients,
+            "total_batches": 1,
+            "sent_count": total_recipients,
+            "failed_count": 0,
+            "batch_size": MAX_RECIPIENTS,
+            "errors": []
+        }
+    
+    # Split recipients into batches
+    sent_count = 0
+    failed_count = 0
+    errors = []
+    
+    # Combine all recipients into a single list with type labels
+    all_recipients = []
+    if to:
+        all_recipients.extend([("to", email) for email in to])
+    if cc:
+        all_recipients.extend([("cc", email) for email in cc])
+    if bcc:
+        all_recipients.extend([("bcc", email) for email in bcc])
+    
+    # Split into batches of MAX_RECIPIENTS
+    batches = []
+    current_batch = {"to": [], "cc": [], "bcc": []}
+    current_count = 0
+    
+    for recipient_type, email in all_recipients:
+        if current_count >= MAX_RECIPIENTS:
+            batches.append(current_batch)
+            current_batch = {"to": [], "cc": [], "bcc": []}
+            current_count = 0
+        
+        current_batch[recipient_type].append(email)
+        current_count += 1
+    
+    # Don't forget the last batch
+    if current_batch["to"] or current_batch["cc"] or current_batch["bcc"]:
+        batches.append(current_batch)
+    
+    # Send each batch
+    for idx, batch in enumerate(batches, 1):
+        batch_to_count = len(batch["to"])
+        batch_cc_count = len(batch["cc"])
+        batch_bcc_count = len(batch["bcc"])
+        batch_total = batch_to_count + batch_cc_count + batch_bcc_count
+        
+        try:
+            send_email(
+                to=batch["to"] if batch["to"] else None,
+                subject=subject,
+                body=body,
+                cc=batch["cc"] if batch["cc"] else None,
+                bcc=batch["bcc"] if batch["bcc"] else None,
+                body_type=body_type,
+                attachments=attachments,
+                importance=importance,
+                token=token
+            )
+            sent_count += batch_total
+            print(f"✓ Batch {idx}/{len(batches)} sent successfully ({batch_total} recipients)")
+        except Exception as e:
+            failed_count += batch_total
+            error_msg = f"Batch {idx} ({batch_total} recipients): {str(e)}"
+            errors.append(error_msg)
+            print(f"✗ Batch {idx}/{len(batches)} failed: {error_msg}")
+    
+    # Prepare response
+    response = {
+        "success": True,
+        "message": f"Email sending completed in {len(batches)} batches",
+        "total_recipients": total_recipients,
+        "total_batches": len(batches),
+        "sent_count": sent_count,
+        "failed_count": failed_count,
+        "batch_size": MAX_RECIPIENTS,
+    }
+    
+    if errors:
+        response["errors"] = errors
+    
+    return response
+
+
+def read_recipients_from_csv(csv_path: str, email_column: str = None) -> List[str]:
+    """
+    Read email addresses from a CSV file.
+    
+    Args:
+        csv_path: Path to the CSV file
+        email_column: Column name containing email addresses (auto-detect if not specified)
+    
+    Returns:
+        List of email addresses
+    """
+    emails = []
+    
+    with open(csv_path, 'r', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        
+        # Auto-detect email column if not specified
+        if not email_column:
+            # Common email column names
+            email_columns = ['email', 'Email', 'EMAIL', 'email_address', 'EmailAddress', 
+                           'Email Address', '邮箱', '邮件', '地址', 'e-mail', 'E-mail']
+            
+            available_columns = reader.fieldnames or []
+            for col in email_columns:
+                if col in available_columns:
+                    email_column = col
+                    break
+            
+            # If still not found, use the first column
+            if not email_column and available_columns:
+                email_column = available_columns[0]
+                print(f"⚠️  Auto-detected column '{email_column}' as email column")
+        
+        if not email_column:
+            raise ValueError("Could not determine email column in CSV file")
+        
+        for row in reader:
+            email = row.get(email_column, '').strip()
+            if email and '@' in email:
+                emails.append(email)
+    
+    return emails
 
 
 # =============================================================================
@@ -537,8 +730,179 @@ def reply_email(
     )
 
 
+def batch_reply_email(
+    message_id: str,
+    body: str,
+    to: List[str] = None,
+    cc: List[str] = None,
+    bcc: List[str] = None,
+    csv_path: str = None,
+    email_column: str = None,
+    body_type: str = "html",
+    include_history: bool = True,
+    importance: str = None,
+    token: str = None
+) -> Dict[str, Any]:
+    """
+    Reply to an email with custom recipients and automatic batching.
+    
+    When total recipients exceed MAX_RECIPIENTS_PER_EMAIL (500),
+    automatically splits them into multiple batches and sends multiple emails.
+    
+    BCC recipients can be loaded from a CSV file for mass mailing.
+    
+    Args:
+        message_id: ID of message to reply to
+        body: Reply body content
+        to: Custom To recipients (overrides default reply behavior)
+        cc: Custom CC recipients
+        bcc: Custom BCC recipients
+        csv_path: Path to CSV file containing BCC email addresses
+        email_column: Column name in CSV for email addresses (auto-detect if not specified)
+        body_type: "html" or "text"
+        include_history: If True, include original message in reply body
+        importance: "low", "normal", or "high"
+        token: Access token
+    
+    Returns:
+        Dictionary with batch processing results
+    """
+    if token is None:
+        token = get_access_token()
+    
+    # Get BCC recipients from CSV if provided
+    if csv_path:
+        print(f"📖 Reading BCC recipients from CSV: {csv_path}")
+        csv_bcc = read_recipients_from_csv(csv_path, email_column)
+        print(f"✓ Found {len(csv_bcc)} BCC recipients in CSV")
+        # Merge with any manually specified BCC
+        bcc = (bcc or []) + csv_bcc
+    
+    # Calculate total recipients
+    to_count = len(to) if to else 0
+    cc_count = len(cc) if cc else 0
+    bcc_count = len(bcc) if bcc else 0
+    total_recipients = to_count + cc_count + bcc_count
+    
+    # Get original message for subject
+    original_msg = get_message(message_id, token)
+    subject = original_msg.get('subject', '')
+    if not subject.upper().startswith('RE:'):
+        subject = f"RE: {subject}"
+    
+    # Build email body with history
+    if include_history and body_type == "html":
+        if not body.strip().startswith('<'):
+            body = body.replace('\n', '<br>\n')
+        full_body = body + "\n\n" + format_email_as_html(original_msg)
+    else:
+        full_body = body
+    
+    # If within limit, use regular send_email
+    if total_recipients <= MAX_RECIPIENTS:
+        send_email(to, subject, full_body, cc, bcc, body_type, None, True, importance, token)
+        return {
+            "success": True,
+            "message": "Reply sent successfully",
+            "total_recipients": total_recipients,
+            "total_batches": 1,
+            "sent_count": total_recipients,
+            "failed_count": 0,
+            "batch_size": MAX_RECIPIENTS,
+            "errors": []
+        }
+    
+    # Split recipients into batches
+    sent_count = 0
+    failed_count = 0
+    errors = []
+    
+    # Combine all recipients into a single list with type labels
+    all_recipients = []
+    if to:
+        all_recipients.extend([("to", email) for email in to])
+    if cc:
+        all_recipients.extend([("cc", email) for email in cc])
+    if bcc:
+        all_recipients.extend([("bcc", email) for email in bcc])
+    
+    # Split into batches of MAX_RECIPIENTS
+    batches = []
+    current_batch = {"to": [], "cc": [], "bcc": []}
+    current_count = 0
+    
+    for recipient_type, email in all_recipients:
+        if current_count >= MAX_RECIPIENTS:
+            batches.append(current_batch)
+            current_batch = {"to": [], "cc": [], "bcc": []}
+            current_count = 0
+        
+        current_batch[recipient_type].append(email)
+        current_count += 1
+    
+    # Don't forget the last batch
+    if current_batch["to"] or current_batch["cc"] or current_batch["bcc"]:
+        batches.append(current_batch)
+    
+    # Send each batch
+    for idx, batch in enumerate(batches, 1):
+        batch_to_count = len(batch["to"])
+        batch_cc_count = len(batch["cc"])
+        batch_bcc_count = len(batch["bcc"])
+        batch_total = batch_to_count + batch_cc_count + batch_bcc_count
+        
+        try:
+            send_email(
+                to=batch["to"] if batch["to"] else None,
+                subject=subject,
+                body=full_body,
+                cc=batch["cc"] if batch["cc"] else None,
+                bcc=batch["bcc"] if batch["bcc"] else None,
+                body_type=body_type,
+                importance=importance,
+                token=token
+            )
+            sent_count += batch_total
+            print(f"✓ Batch {idx}/{len(batches)} sent successfully ({batch_total} recipients)")
+        except Exception as e:
+            failed_count += batch_total
+            error_msg = f"Batch {idx} ({batch_total} recipients): {str(e)}"
+            errors.append(error_msg)
+            print(f"✗ Batch {idx}/{len(batches)} failed: {error_msg}")
+    
+    # Prepare response
+    response = {
+        "success": True,
+        "message": f"Reply sending completed in {len(batches)} batches",
+        "total_recipients": total_recipients,
+        "total_batches": len(batches),
+        "sent_count": sent_count,
+        "failed_count": failed_count,
+        "batch_size": MAX_RECIPIENTS,
+    }
+    
+    if errors:
+        response["errors"] = errors
+    
+    return response
+
+
 def get_my_email(token: str = None) -> str:
-    """Get current user's email address."""
+    """Get current user's email address from cached token data."""
+    from config import TOKEN_CACHE_FILE
+    
+    # Read from token cache file to avoid API call
+    try:
+        if TOKEN_CACHE_FILE.exists():
+            with open(TOKEN_CACHE_FILE, "r", encoding='utf-8') as f:
+                token_data = json.load(f)
+                username = token_data.get("username")
+                if username:
+                    return username
+    except Exception:
+        pass
+    
+    # Fallback: call API
     if token is None:
         token = get_access_token()
     
@@ -586,6 +950,10 @@ def forward_email(
     if token is None:
         token = get_access_token()
     
+    # If no To recipients but has BCC/CC, set current user as To (Graph API requires To)
+    if not to and (bcc or cc):
+        to = [get_my_email(token)]
+    
     # Validate recipients
     validate_recipients(to, cc, bcc)
     
@@ -627,6 +995,159 @@ def forward_email(
         raise Exception(f"Failed to forward email: {response.status_code} - {response.text}")
     
     return True
+
+
+def batch_forward_email(
+    message_id: str,
+    to: List[str] = None,
+    cc: List[str] = None,
+    bcc: List[str] = None,
+    csv_path: str = None,
+    email_column: str = None,
+    comment: str = "",
+    body_type: str = "html",
+    token: str = None
+) -> Dict[str, Any]:
+    """
+    Forward an email to multiple recipients with automatic batching.
+    
+    When total recipients exceed MAX_RECIPIENTS_PER_EMAIL (500), 
+    automatically splits them into multiple batches and sends multiple emails.
+    
+    BCC recipients can be loaded from a CSV file for mass mailing.
+    
+    Args:
+        message_id: ID of message to forward
+        to: List of To recipient emails
+        cc: List of CC recipient emails
+        bcc: List of BCC recipient emails
+        csv_path: Path to CSV file containing BCC email addresses
+        email_column: Column name in CSV for email addresses (auto-detect if not specified)
+        comment: Optional comment to add at the top
+        body_type: "html" or "text"
+        token: Access token
+    
+    Returns:
+        Dictionary with batch processing results:
+        {
+            "success": True,
+            "message": "Email forwarding completed in X batches",
+            "total_recipients": total,
+            "total_batches": num_batches,
+            "sent_count": sent,
+            "failed_count": failed,
+            "batch_size": MAX_RECIPIENTS_PER_EMAIL,
+            "errors": []  # List of error messages if any
+        }
+    """
+    if token is None:
+        token = get_access_token()
+    
+    # Get BCC recipients from CSV if provided
+    if csv_path:
+        print(f"📖 Reading BCC recipients from CSV: {csv_path}")
+        csv_bcc = read_recipients_from_csv(csv_path, email_column)
+        print(f"✓ Found {len(csv_bcc)} BCC recipients in CSV")
+        # Merge with any manually specified BCC
+        bcc = (bcc or []) + csv_bcc
+    
+    # If no To recipients but has BCC/CC, set current user as To (Graph API requires To)
+    if not to and (bcc or cc):
+        to = [get_my_email(token)]
+        print(f"ℹ️  No To recipient specified, using current user as To: {to[0]}")
+    
+    # Calculate total recipients
+    to_count = len(to) if to else 0
+    cc_count = len(cc) if cc else 0
+    bcc_count = len(bcc) if bcc else 0
+    total_recipients = to_count + cc_count + bcc_count
+    
+    # If within limit, use regular forward_email
+    if total_recipients <= MAX_RECIPIENTS:
+        forward_email(message_id, to, cc, bcc, comment, body_type, True, token)
+        return {
+            "success": True,
+            "message": "Email forwarded successfully",
+            "total_recipients": total_recipients,
+            "total_batches": 1,
+            "sent_count": total_recipients,
+            "failed_count": 0,
+            "batch_size": MAX_RECIPIENTS,
+            "errors": []
+        }
+    
+    # Split recipients into batches
+    sent_count = 0
+    failed_count = 0
+    errors = []
+    
+    # Combine all recipients into a single list with type labels
+    all_recipients = []
+    if to:
+        all_recipients.extend([("to", email) for email in to])
+    if cc:
+        all_recipients.extend([("cc", email) for email in cc])
+    if bcc:
+        all_recipients.extend([("bcc", email) for email in bcc])
+    
+    # Split into batches of MAX_RECIPIENTS
+    batches = []
+    current_batch = {"to": [], "cc": [], "bcc": []}
+    current_count = 0
+    
+    for recipient_type, email in all_recipients:
+        if current_count >= MAX_RECIPIENTS:
+            batches.append(current_batch)
+            current_batch = {"to": [], "cc": [], "bcc": []}
+            current_count = 0
+        
+        current_batch[recipient_type].append(email)
+        current_count += 1
+    
+    # Don't forget the last batch
+    if current_batch["to"] or current_batch["cc"] or current_batch["bcc"]:
+        batches.append(current_batch)
+    
+    # Send each batch
+    for idx, batch in enumerate(batches, 1):
+        batch_to_count = len(batch["to"])
+        batch_cc_count = len(batch["cc"])
+        batch_bcc_count = len(batch["bcc"])
+        batch_total = batch_to_count + batch_cc_count + batch_bcc_count
+        
+        try:
+            forward_email(
+                message_id=message_id,
+                to=batch["to"] if batch["to"] else None,
+                cc=batch["cc"] if batch["cc"] else None,
+                bcc=batch["bcc"] if batch["bcc"] else None,
+                comment=comment,
+                body_type=body_type,
+                token=token
+            )
+            sent_count += batch_total
+            print(f"✓ Batch {idx}/{len(batches)} sent successfully ({batch_total} recipients)")
+        except Exception as e:
+            failed_count += batch_total
+            error_msg = f"Batch {idx} ({batch_total} recipients): {str(e)}"
+            errors.append(error_msg)
+            print(f"✗ Batch {idx}/{len(batches)} failed: {error_msg}")
+    
+    # Prepare response
+    response = {
+        "success": True,
+        "message": f"Email forwarding completed in {len(batches)} batches",
+        "total_recipients": total_recipients,
+        "total_batches": len(batches),
+        "sent_count": sent_count,
+        "failed_count": failed_count,
+        "batch_size": MAX_RECIPIENTS,
+    }
+    
+    if errors:
+        response["errors"] = errors
+    
+    return response
 
 
 # =============================================================================
@@ -991,28 +1512,37 @@ def main():
     thread_parser = subparsers.add_parser("thread", help="Get conversation thread")
     thread_parser.add_argument("message_id", help="Message ID (any message in the thread)")
     
-    # Send command
-    send_parser = subparsers.add_parser("send", help="Send an email")
-    send_parser.add_argument("--to", required=True, help="To recipients (comma-separated)")
+    # Send command (supports batching automatically)
+    send_parser = subparsers.add_parser("send", help="Send an email (auto-batch for large recipient lists)")
+    send_parser.add_argument("--to", help="To recipients (comma-separated)")
     send_parser.add_argument("--cc", help="CC recipients (comma-separated)")
     send_parser.add_argument("--bcc", help="BCC recipients (comma-separated)")
+    send_parser.add_argument("--csv", dest="csv_path", help="CSV file containing BCC email addresses")
+    send_parser.add_argument("--email-column", help="Column name in CSV for emails (auto-detected if not specified)")
     send_parser.add_argument("--subject", required=True, help="Email subject")
     send_parser.add_argument("--body", required=True, help="Email body")
     send_parser.add_argument("--body-type", choices=["html", "text"], default="html")
     
-    # Reply command
-    reply_parser = subparsers.add_parser("reply", help="Reply to an email")
+    # Reply command (supports batching automatically)
+    reply_parser = subparsers.add_parser("reply", help="Reply to an email (auto-batch for large recipient lists)")
     reply_parser.add_argument("message_id", help="Message ID to reply to")
     reply_parser.add_argument("--body", required=True, help="Reply body")
     reply_parser.add_argument("--all", dest="reply_all", action="store_true", help="Reply to all")
+    reply_parser.add_argument("--to", help="Additional To recipients (comma-separated)")
+    reply_parser.add_argument("--cc", help="Additional CC recipients (comma-separated)")
+    reply_parser.add_argument("--bcc", help="BCC recipients (comma-separated)")
+    reply_parser.add_argument("--csv", dest="csv_path", help="CSV file containing BCC email addresses")
+    reply_parser.add_argument("--email-column", help="Column name in CSV for emails (auto-detected if not specified)")
     reply_parser.add_argument("--importance", choices=["low", "normal", "high"], help="Email importance level")
     
-    # Forward command
-    forward_parser = subparsers.add_parser("forward", help="Forward an email")
+    # Forward command (supports batching automatically)
+    forward_parser = subparsers.add_parser("forward", help="Forward an email (auto-batch for large recipient lists)")
     forward_parser.add_argument("message_id", help="Message ID to forward")
-    forward_parser.add_argument("--to", required=True, help="To recipients (comma-separated)")
+    forward_parser.add_argument("--to", help="To recipients (comma-separated)")
     forward_parser.add_argument("--cc", help="CC recipients (comma-separated)")
     forward_parser.add_argument("--bcc", help="BCC recipients (comma-separated)")
+    forward_parser.add_argument("--csv", dest="csv_path", help="CSV file containing BCC email addresses")
+    forward_parser.add_argument("--email-column", help="Column name in CSV for emails (auto-detected if not specified)")
     forward_parser.add_argument("--comment", default="", help="Comment to add")
     
     # Mark read/unread
@@ -1114,41 +1644,101 @@ def main():
                 display_thread(messages)
         
         elif args.command == "send":
-            send_email(
-                to=parse_email_list(args.to),
+            result = batch_send_email(
+                to=parse_email_list(args.to) if args.to else None,
                 subject=args.subject,
                 body=args.body,
                 cc=parse_email_list(args.cc) if args.cc else None,
                 bcc=parse_email_list(args.bcc) if args.bcc else None,
+                csv_path=getattr(args, 'csv_path', None),
+                email_column=getattr(args, 'email_column', None),
                 body_type=args.body_type
             )
             if args.json:
-                print(json.dumps({"success": True, "message": "Email sent successfully"}))
+                print(json.dumps(result, indent=2))
+            elif result['total_batches'] > 1:
+                print(f"\n{'='*60}")
+                print(f"SEND RESULTS (Batched)")
+                print(f"{'='*60}")
+                print(f"Total recipients: {result['total_recipients']}")
+                print(f"Total batches: {result['total_batches']}")
+                print(f"Sent: {result['sent_count']}")
+                print(f"Failed: {result['failed_count']}")
+                if result.get('errors'):
+                    print(f"\nErrors:")
+                    for error in result['errors']:
+                        print(f"  - {error}")
+                print(f"{'='*60}")
             else:
                 print("✓ Email sent successfully")
         
         elif args.command == "reply":
-            reply_email(
-                message_id=args.message_id,
-                body=args.body,
-                reply_all=args.reply_all,
-                importance=getattr(args, 'importance', None)
-            )
-            if args.json:
-                print(json.dumps({"success": True, "message": "Reply sent successfully"}))
+            # If --all or no extra recipients, use standard reply
+            has_extra_recipients = args.to or args.cc or args.bcc or getattr(args, 'csv_path', None)
+            if args.reply_all and not has_extra_recipients:
+                reply_email(
+                    message_id=args.message_id,
+                    body=args.body,
+                    reply_all=True,
+                    importance=getattr(args, 'importance', None)
+                )
+                if args.json:
+                    print(json.dumps({"success": True, "message": "Reply sent successfully"}))
+                else:
+                    print("✓ Reply sent successfully")
             else:
-                print("✓ Reply sent successfully")
+                result = batch_reply_email(
+                    message_id=args.message_id,
+                    body=args.body,
+                    to=parse_email_list(args.to) if args.to else None,
+                    cc=parse_email_list(args.cc) if args.cc else None,
+                    bcc=parse_email_list(args.bcc) if args.bcc else None,
+                    csv_path=getattr(args, 'csv_path', None),
+                    email_column=getattr(args, 'email_column', None)
+                )
+                if args.json:
+                    print(json.dumps(result, indent=2))
+                elif result['total_batches'] > 1:
+                    print(f"\n{'='*60}")
+                    print(f"REPLY RESULTS (Batched)")
+                    print(f"{'='*60}")
+                    print(f"Total recipients: {result['total_recipients']}")
+                    print(f"Total batches: {result['total_batches']}")
+                    print(f"Sent: {result['sent_count']}")
+                    print(f"Failed: {result['failed_count']}")
+                    if result.get('errors'):
+                        print(f"\nErrors:")
+                        for error in result['errors']:
+                            print(f"  - {error}")
+                    print(f"{'='*60}")
+                else:
+                    print("✓ Reply sent successfully")
         
         elif args.command == "forward":
-            forward_email(
+            result = batch_forward_email(
                 message_id=args.message_id,
-                to=parse_email_list(args.to),
+                to=parse_email_list(args.to) if args.to else None,
                 cc=parse_email_list(args.cc) if args.cc else None,
                 bcc=parse_email_list(args.bcc) if args.bcc else None,
+                csv_path=getattr(args, 'csv_path', None),
+                email_column=getattr(args, 'email_column', None),
                 comment=args.comment
             )
             if args.json:
-                print(json.dumps({"success": True, "message": "Email forwarded successfully"}))
+                print(json.dumps(result, indent=2))
+            elif result['total_batches'] > 1:
+                print(f"\n{'='*60}")
+                print(f"FORWARD RESULTS (Batched)")
+                print(f"{'='*60}")
+                print(f"Total recipients: {result['total_recipients']}")
+                print(f"Total batches: {result['total_batches']}")
+                print(f"Sent: {result['sent_count']}")
+                print(f"Failed: {result['failed_count']}")
+                if result.get('errors'):
+                    print(f"\nErrors:")
+                    for error in result['errors']:
+                        print(f"  - {error}")
+                print(f"{'='*60}")
             else:
                 print("✓ Email forwarded successfully")
         

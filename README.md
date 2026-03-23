@@ -6,6 +6,8 @@ A comprehensive Python skill for interacting with Microsoft Graph API, providing
 
 - **Authentication**: OAuth2 device code flow with automatic token refresh and robust error handling
 - **Email Operations**: Read, send, reply, forward emails with CC/BCC support
+- **Batch Email Operations**: Send/forward/reply to >500 recipients with automatic batching
+- **Mass Mailing (BCC)**: Send newsletters/campaigns using BCC only from CSV file
 - **Email Search**: Search emails by sender, recipient, subject, or content
 - **Email Find**: One-step find and display specific email (combines search + get)
 - **Email Threads**: View complete conversation threads
@@ -40,7 +42,7 @@ python scripts/auth.py --logout
 python scripts/auth.py --status --verbose
 ```
 
-**Note:** Tokens auto-refresh via `--status`. Manual `--refresh` is optional.
+**Note:** Tokens auto-refresh via `--status`.
 
 **Robustness Features:**
 - Automatic cleanup of expired device flows
@@ -89,6 +91,12 @@ python scripts/email_operations.py reply <message_id> --body "Reply content" --i
 python scripts/email_operations.py forward <message_id> \
   --to "recipient@example.com" \
   --comment "FYI"
+
+# Mass mailing with CSV (auto-batch for >500 recipients)
+python scripts/email_operations.py send \
+  --csv recipients.csv \
+  --subject "Monthly Newsletter" \
+  --body "<html><body>...</body></html>"
 ```
 
 **Smart Pattern Detection:**

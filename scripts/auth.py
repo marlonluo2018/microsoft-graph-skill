@@ -7,10 +7,10 @@ Provides OAuth2 device code flow authentication for Microsoft Graph API.
 Tokens are cached locally for subsequent use.
 
 Usage:
-    python auth.py --start              # Start auth flow, output URL and code as JSON
-    python auth.py --complete           # Complete auth flow (after user enters code)
-    python auth.py --status             # Check authentication status
-    python auth.py --logout             # Clear cached tokens
+    python auth.py --start     # Start auth flow, output URL and code
+    python auth.py --complete  # Complete auth flow (after user enters code)
+    python auth.py --status    # Check authentication status
+    python auth.py --logout    # Clear cached tokens
 """
 
 import os
@@ -20,7 +20,7 @@ import time
 import logging
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from functools import wraps
 import threading
 
@@ -131,14 +131,13 @@ class TokenManager:
     def _cleanup_expired_flow(self) -> None:
         """Clean up expired device flow to prevent authentication errors."""
         try:
-            flow = load_device_flow()
-            # Check if 'expires_at' key exists and value is set (use 'in' instead of truthy check)
+            flow = _load_device_flow()
             if flow and 'expires_at' in flow and flow['expires_at'] is not None:
                 if time.time() > flow['expires_at']:
-                    clear_device_flow()
-                    logger.info("清理了过期的设备流程记录")
+                    _clear_device_flow()
+                    logger.info("Cleaned up expired device flow record")
         except Exception as e:
-            logger.warning(f"清理过期流程时出错: {e}")
+            logger.warning(f"Error cleaning up expired flow: {e}")
     
     def load_tokens_from_disk(self) -> None:
         """Load authentication tokens from disk."""
@@ -251,10 +250,10 @@ class TokenManager:
 
 
 # =============================================================================
-# Device Flow Management
+# Device Flow Management (Internal)
 # =============================================================================
 
-def save_device_flow(flow: Dict[str, Any]) -> None:
+def _save_device_flow(flow: Dict[str, Any]) -> None:
     """Save device flow to disk."""
     ensure_cache_dir()
     try:
@@ -266,7 +265,7 @@ def save_device_flow(flow: Dict[str, Any]) -> None:
         raise
 
 
-def load_device_flow() -> Optional[Dict[str, Any]]:
+def _load_device_flow() -> Optional[Dict[str, Any]]:
     """Load device flow from disk."""
     if not DEVICE_FLOW_FILE.exists():
         return None
@@ -284,7 +283,7 @@ def load_device_flow() -> Optional[Dict[str, Any]]:
         return None
 
 
-def clear_device_flow() -> None:
+def _clear_device_flow() -> None:
     """Clear device flow from disk."""
     if DEVICE_FLOW_FILE.exists():
         try:
@@ -295,10 +294,10 @@ def clear_device_flow() -> None:
 
 
 # =============================================================================
-# Authentication Functions
+# Internal Helper Functions
 # =============================================================================
 
-def create_app(client_id: str) -> PublicClientApplication:
+def _create_app(client_id: str) -> PublicClientApplication:
     """Create MSAL PublicClientApplication."""
     if not TENANT_ID:
         raise ValueError("TENANT_ID is not configured")
@@ -310,152 +309,36 @@ def create_app(client_id: str) -> PublicClientApplication:
     )
 
 
-@retry_on_failure(max_retries=3, delay=1.0)
-def start_auth_flow(client_id: str = None, scopes: list = None) -> Dict[str, Any]:
+def _ensure_valid_token(client_id: str = None, scopes: list = None) -> Tuple[bool, 'TokenManager', Optional[str]]:
     """
-    Start device code flow and return URL and code.
-    Does NOT wait for completion.
-
+    Ensure token is valid, refresh if necessary.
+    
     Returns:
-        dict: {"url": "...", "code": "..."} or {"error": "..."}
+        tuple: (success: bool, token_manager: TokenManager, error: Optional[str])
     """
-    # Validate configuration
-    if not validate_config():
-        return {"error": "Configuration error: TENANT_ID not set"}
-
-    if client_id is None:
-        client_id = CLIENT_ID or os.environ.get("MS_GRAPH_CLIENT_ID")
-
-    if not client_id:
-        return {"error": "Client ID is required. Set CLIENT_ID in config.py or MS_GRAPH_CLIENT_ID environment variable"}
-
-    if scopes is None:
-        scopes = DEFAULT_SCOPES
-
-    logger.info(f"Starting auth flow for client_id: {client_id}")
-
-    # Check if already authenticated
     token_manager = TokenManager()
+    
+    # Token is valid, return directly
     if token_manager.is_token_valid():
-        logger.info(f"Already authenticated as {token_manager.username}")
-        return {
-            "status": "already_authenticated",
-            "message": "Already authenticated",
-            "username": token_manager.username,
-            "expires": datetime.fromtimestamp(token_manager.token_expiry).isoformat(),
-            "expires_in": token_manager.get_token_expiry_info()['display']
-        }
-
-    app = create_app(client_id)
-
-    # Initiate device code flow
-    flow = app.initiate_device_flow(scopes=scopes)
-
-    if 'verification_uri' not in flow:
-        error_msg = flow.get('error_description', flow.get('error', 'Failed to initiate flow'))
-        logger.error(f"Failed to initiate device flow: {error_msg}")
-        return {"error": error_msg}
-
-    # Add expires_at timestamp
-    expires_in = flow.get('expires_in', 900)
-    flow['expires_at'] = time.time() + expires_in
-    flow['client_id'] = client_id
-    flow['scopes'] = scopes
-
-    # Save flow to disk
-    save_device_flow(flow)
-
-    logger.info(f"Device flow started. User code: {flow['user_code']}, expires in {expires_in}s")
-
-    return {
-        "url": flow['verification_uri'],
-        "code": flow['user_code'],
-        "message": f"To sign in, open {flow['verification_uri']} and enter code {flow['user_code']}",
-        "expires_in": expires_in
-    }
+        return True, token_manager, None
+    
+    # Token expired but we have refresh_token, try to refresh
+    if token_manager.refresh_token:
+        logger.info("Token expired, attempting refresh...")
+        result = _refresh_token(client_id, scopes)
+        if result.get('success'):
+            token_manager = TokenManager()  # Reload updated token
+            return True, token_manager, None
+        return False, token_manager, result.get('error')
+    
+    # No valid token
+    return False, token_manager, "No valid token available"
 
 
 @retry_on_failure(max_retries=3, delay=1.0)
-def complete_auth_flow() -> Dict[str, Any]:
+def _refresh_token(client_id: str = None, scopes: list = None) -> Dict[str, Any]:
     """
-    Complete the pending authentication flow.
-
-    Returns:
-        dict: {"success": True, ...} or {"error": "..."} or {"status": "pending", ...}
-    """
-    flow = load_device_flow()
-
-    if not flow:
-        logger.warning("No pending authentication flow found")
-        return {"error": "No pending authentication flow. Run --start first."}
-
-    # Check if flow expired
-    if 'expires_at' in flow and flow['expires_at'] is not None and time.time() > flow['expires_at']:
-        clear_device_flow()
-        logger.warning("Device flow expired")
-        return {"error": "Authentication flow expired. Please start again with --start."}
-
-    client_id = flow.get('client_id', CLIENT_ID)
-    scopes = flow.get('scopes', DEFAULT_SCOPES)
-
-    logger.info(f"Completing auth flow for client_id: {client_id}")
-
-    app = create_app(client_id)
-    token_manager = TokenManager()
-
-    # Acquire token using device flow
-    result = app.acquire_token_by_device_flow(flow)
-
-    if 'access_token' in result:
-        # Get account info
-        accounts = app.get_accounts()
-        username = accounts[0].get('username', 'Unknown') if accounts else 'Unknown'
-
-        logger.info(f"Authentication successful for user: {username}")
-
-        # Update token manager
-        token_manager.update_token(
-            access_token=result['access_token'],
-            expires_in=int(result.get('expires_in', 3600)),
-            refresh_token=result.get('refresh_token'),
-            username=username,
-        )
-
-        # Clear device flow
-        clear_device_flow()
-
-        expiry_info = token_manager.get_token_expiry_info()
-
-        return {
-            "success": True,
-            "username": username,
-            "expires": datetime.fromtimestamp(token_manager.token_expiry).isoformat(),
-            "expires_in": expiry_info['display']
-        }
-    else:
-        error = result.get('error', 'unknown')
-        error_description = result.get('error_description', error)
-
-        if error == 'authorization_pending':
-            logger.debug("Authorization pending, waiting for user...")
-            return {"status": "pending", "message": "Waiting for user to complete authentication..."}
-        elif error == 'expired':
-            clear_device_flow()
-            logger.warning("Device flow expired during completion")
-            return {"error": "Authentication expired. Please start again."}
-        elif error == 'authorization_declined':
-            clear_device_flow()
-            logger.warning("Authorization declined by user")
-            return {"error": "Authentication was declined. Please try again."}
-        else:
-            logger.error(f"Authentication failed: {error_description}")
-            return {"error": error_description, "code": error}
-
-
-@retry_on_failure(max_retries=3, delay=1.0)
-def refresh_token(client_id: str = None, scopes: list = None) -> Dict[str, Any]:
-    """
-    Refresh the access token using the refresh token.
+    Refresh the access token using the refresh token. (Internal use)
 
     Returns:
         dict: {"success": True, ...} or {"error": "..."}
@@ -474,7 +357,7 @@ def refresh_token(client_id: str = None, scopes: list = None) -> Dict[str, Any]:
 
     logger.info(f"Refreshing token for user: {token_manager.username}")
 
-    app = create_app(client_id)
+    app = _create_app(client_id)
 
     # Build the token request with refresh token
     result = app.acquire_token_by_refresh_token(
@@ -497,14 +380,9 @@ def refresh_token(client_id: str = None, scopes: list = None) -> Dict[str, Any]:
             username=username,
         )
 
-        expiry_info = token_manager.get_token_expiry_info()
-
         return {
             "success": True,
-            "username": username,
-            "expires": datetime.fromtimestamp(token_manager.token_expiry).isoformat(),
-            "expires_in": expiry_info['display'],
-            "message": "Token refreshed successfully."
+            "username": username
         }
     else:
         error = result.get('error', 'unknown')
@@ -519,7 +397,146 @@ def refresh_token(client_id: str = None, scopes: list = None) -> Dict[str, Any]:
         return {"error": error_description, "code": error}
 
 
-def check_status(client_id: str = None) -> Dict[str, Any]:
+# =============================================================================
+# Public API Functions
+# =============================================================================
+
+@retry_on_failure(max_retries=3, delay=1.0)
+def start(client_id: str = None, scopes: list = None) -> Dict[str, Any]:
+    """
+    Start device code flow and return URL + code (does NOT wait for completion).
+
+    Returns:
+        dict: {"url": "...", "code": "..."} or {"status": "already_authenticated"} or {"error": "..."}
+    """
+    # Validate configuration
+    if not validate_config():
+        return {"error": "Configuration error: TENANT_ID not set"}
+
+    if client_id is None:
+        client_id = CLIENT_ID or os.environ.get("MS_GRAPH_CLIENT_ID")
+
+    if not client_id:
+        return {"error": "Client ID is required. Set CLIENT_ID in config.py or MS_GRAPH_CLIENT_ID environment variable"}
+
+    if scopes is None:
+        scopes = DEFAULT_SCOPES
+
+    logger.info(f"Starting auth flow for client_id: {client_id}")
+
+    # Check if already authenticated
+    token_manager = TokenManager()
+    if token_manager.is_token_valid():
+        logger.info(f"Already authenticated as {token_manager.username}")
+        return {
+            "status": "already_authenticated",
+            "username": token_manager.username
+        }
+
+    app = _create_app(client_id)
+
+    # Initiate device code flow
+    flow = app.initiate_device_flow(scopes=scopes)
+
+    if 'verification_uri' not in flow:
+        error_msg = flow.get('error_description', flow.get('error', 'Failed to initiate flow'))
+        logger.error(f"Failed to initiate device flow: {error_msg}")
+        return {"error": error_msg}
+
+    # Add expires_at timestamp and metadata
+    expires_in = flow.get('expires_in', 900)
+    flow['expires_at'] = time.time() + expires_in
+    flow['client_id'] = client_id
+    flow['scopes'] = scopes
+
+    # Save flow to disk for later completion
+    _save_device_flow(flow)
+
+    logger.info(f"Device flow started. User code: {flow['user_code']}, expires in {expires_in}s")
+
+    return {
+        "url": flow['verification_uri'],
+        "code": flow['user_code'],
+        "message": f"Open {flow['verification_uri']} in browser and enter code: {flow['user_code']}",
+        "expires_in": expires_in
+    }
+
+
+@retry_on_failure(max_retries=3, delay=1.0)
+def complete() -> Dict[str, Any]:
+    """
+    Complete the pending authentication flow.
+
+    Returns:
+        dict: {"success": True, ...} or {"status": "pending"} or {"error": "..."}
+    """
+    flow = _load_device_flow()
+
+    if not flow:
+        logger.warning("No pending authentication flow found")
+        return {"error": "No pending authentication flow. Run --start first."}
+
+    # Check if flow expired
+    if 'expires_at' in flow and flow['expires_at'] is not None and time.time() > flow['expires_at']:
+        _clear_device_flow()
+        logger.warning("Device flow expired")
+        return {"error": "Authentication flow expired. Please start again with --start."}
+
+    client_id = flow.get('client_id', CLIENT_ID)
+    scopes = flow.get('scopes', DEFAULT_SCOPES)
+
+    logger.info(f"Completing auth flow for client_id: {client_id}")
+
+    app = _create_app(client_id)
+    token_manager = TokenManager()
+
+    # Acquire token using device flow
+    result = app.acquire_token_by_device_flow(flow)
+
+    if 'access_token' in result:
+        # Get account info
+        accounts = app.get_accounts()
+        username = accounts[0].get('username', 'Unknown') if accounts else 'Unknown'
+
+        logger.info(f"Authentication successful for user: {username}")
+
+        # Update token manager
+        token_manager.update_token(
+            access_token=result['access_token'],
+            expires_in=int(result.get('expires_in', 3600)),
+            refresh_token=result.get('refresh_token'),
+            username=username,
+        )
+
+        # Clear device flow
+        _clear_device_flow()
+
+        return {
+            "success": True,
+            "username": username,
+            "message": "Login successful!"
+        }
+    else:
+        error = result.get('error', 'unknown')
+        error_description = result.get('error_description', error)
+
+        if error == 'authorization_pending':
+            logger.debug("Authorization pending, waiting for user...")
+            return {"status": "pending", "message": "Waiting for user to complete authentication..."}
+        elif error == 'expired':
+            _clear_device_flow()
+            logger.warning("Device flow expired during completion")
+            return {"error": "Authentication expired. Please start again with --start."}
+        elif error == 'authorization_declined':
+            _clear_device_flow()
+            logger.warning("Authorization declined by user")
+            return {"error": "Authentication was declined. Please try again."}
+        else:
+            logger.error(f"Authentication failed: {error_description}")
+            return {"error": error_description, "code": error}
+
+
+def status(client_id: str = None) -> Dict[str, Any]:
     """
     Check authentication status with automatic token refresh.
 
@@ -527,54 +544,28 @@ def check_status(client_id: str = None) -> Dict[str, Any]:
         client_id: Client ID (optional, for token refresh)
 
     Returns:
-        dict: Authentication status information
+        dict: {"authenticated": True, "username": "..."} or {"authenticated": False, "action": "..."}
     """
     logger.debug("Checking authentication status")
-    token_manager = TokenManager()
-
-    if token_manager.is_token_valid():
-        expiry_info = token_manager.get_token_expiry_info()
-        logger.info(f"Authenticated as {token_manager.username}, token expires in {expiry_info['display']}")
+    success, token_manager, error = _ensure_valid_token(client_id)
+    
+    if success:
+        logger.info(f"Authenticated as {token_manager.username}")
         return {
             "authenticated": True,
-            "username": token_manager.username,
-            "expires": datetime.fromtimestamp(token_manager.token_expiry).isoformat(),
-            "expires_in": expiry_info['display']
+            "username": token_manager.username
         }
-    elif token_manager.refresh_token:
-        # Token expired but we have a refresh token, try to refresh
-        logger.info("Token expired, attempting to refresh...")
-        refresh_result = refresh_token(client_id)
-        if refresh_result.get('success'):
-            return {
-                "authenticated": True,
-                "username": refresh_result.get('username'),
-                "expires": refresh_result.get('expires'),
-                "expires_in": refresh_result.get('expires_in'),
-                "refreshed": True,
-                "message": "令牌已自动刷新"
-            }
-        else:
-            error_msg = refresh_result.get('error', 'Unknown error')
-            logger.warning(f"Token refresh failed: {error_msg}")
-            return {
-                "authenticated": False,
-                "message": f"令牌过期且刷新失败: {error_msg}",
-                "action": "请重新登录: python auth.py --start"
-            }
-    else:
-        logger.info("Not authenticated - no token available")
-        return {
-            "authenticated": False,
-            "message": "Not authenticated or token expired.",
-            "action": "请运行: python auth.py --start"
-        }
+    
+    return {
+        "authenticated": False,
+        "action": "Run: python auth.py --start"
+    }
 
 
 def logout() -> Dict[str, Any]:
     """Clear cached tokens."""
     logger.info("Logging out...")
-    clear_device_flow()
+    _clear_device_flow()
     token_manager = TokenManager()
     token_manager.clear_tokens()
     return {"success": True, "message": "Logged out successfully."}
@@ -595,25 +586,8 @@ def get_access_token(client_id: str = None, scopes: list = None) -> Optional[str
     Returns:
         str: Access token or None if not authenticated
     """
-    token_manager = TokenManager()
-
-    # If token is valid, return it
-    if token_manager.is_token_valid():
-        logger.debug("Returning valid access token")
-        return token_manager.access_token
-
-    # If token expired but we have a refresh token, try to refresh
-    if token_manager.refresh_token:
-        logger.info("Token expired, attempting refresh...")
-        refresh_result = refresh_token(client_id, scopes)
-        if refresh_result.get('success'):
-            logger.info("Token refreshed successfully")
-            return token_manager.access_token
-        else:
-            logger.error("Failed to refresh token")
-
-    logger.warning("No valid access token available")
-    return None
+    success, token_manager, _ = _ensure_valid_token(client_id, scopes)
+    return token_manager.access_token if success else None
 
 
 def get_token_manager() -> TokenManager:
@@ -638,7 +612,6 @@ def main():
     parser.add_argument("--start", action="store_true", help="Start auth flow (output URL and code)")
     parser.add_argument("--complete", action="store_true", help="Complete auth flow")
     parser.add_argument("--status", action="store_true", help="Check authentication status")
-    parser.add_argument("--refresh", action="store_true", help="Refresh access token")
     parser.add_argument("--logout", action="store_true", help="Clear cached tokens")
     parser.add_argument("--client-id", help="Azure AD application client ID")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
@@ -655,20 +628,18 @@ def main():
         if args.logout:
             result = logout()
         elif args.status:
-            result = check_status(args.client_id)
-        elif args.refresh:
-            result = refresh_token(args.client_id)
-        elif args.start:
-            result = start_auth_flow(args.client_id)
+            result = status(args.client_id)
         elif args.complete:
-            result = complete_auth_flow()
+            result = complete()
+        elif args.start:
+            result = start(args.client_id)
         else:
             # Default: check status, if not authenticated, start flow
-            status = check_status(args.client_id)
-            if status.get("authenticated"):
-                result = status
+            auth_status = status(args.client_id)
+            if auth_status.get("authenticated"):
+                result = auth_status
             else:
-                result = start_auth_flow(args.client_id)
+                result = start(args.client_id)
     except KeyboardInterrupt:
         logger.info("Operation cancelled by user")
         result = {"error": "Operation cancelled"}
