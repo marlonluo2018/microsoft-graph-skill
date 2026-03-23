@@ -72,8 +72,18 @@ python scripts/email_operations.py send \
   --subject "Test Subject" \
   --body "Email body content"
 
+# Send high-importance email
+python scripts/email_operations.py send \
+  --to "recipient@example.com" \
+  --subject "Urgent" \
+  --body "Email body" \
+  --importance high
+
 # Reply to email
 python scripts/email_operations.py reply <message_id> --body "Reply content"
+
+# Reply with high importance
+python scripts/email_operations.py reply <message_id> --body "Reply content" --importance high
 
 # Forward email (preserves attachments)
 python scripts/email_operations.py forward <message_id> \

@@ -323,6 +323,7 @@ def send_email(
     body_type: str = "html",
     attachments: List[Dict] = None,
     save_to_sent: bool = True,
+    importance: str = None,
     token: str = None
 ) -> bool:
     """
@@ -337,6 +338,7 @@ def send_email(
         body_type: "html" or "text"
         attachments: List of attachment objects
         save_to_sent: Whether to save to Sent Items
+        importance: "low", "normal", or "high"
         token: Access token
     
     Returns:
@@ -359,6 +361,10 @@ def send_email(
         "ccRecipients": [format_email_address(e) for e in (cc or [])],
         "bccRecipients": [format_email_address(e) for e in (bcc or [])]
     }
+    
+    # Add importance if specified
+    if importance and importance.lower() in ['low', 'normal', 'high']:
+        message["importance"] = importance.lower()
     
     # Add attachments if provided
     if attachments:
@@ -443,6 +449,7 @@ def reply_email(
     reply_all: bool = False,
     body_type: str = "html",
     include_history: bool = True,
+    importance: str = None,
     token: str = None
 ) -> bool:
     """
@@ -454,6 +461,7 @@ def reply_email(
         reply_all: If True, reply to all recipients; otherwise reply to sender only
         body_type: "html" or "text"
         include_history: If True, include original message in reply body (default: True)
+        importance: "low", "normal", or "high"
         token: Access token
     
     Returns:
@@ -477,7 +485,7 @@ def reply_email(
     
     # Determine recipients
     from_addr = original_msg.get('from', {}).get('emailAddress', {})
-    to_recipients = [from_addr.get('address')]
+    to_recipients = []
     cc_recipients = []
     
     if reply_all:
@@ -485,14 +493,22 @@ def reply_email(
         my_email = get_my_email(token)
         for recipient in original_msg.get('toRecipients', []):
             email = recipient.get('emailAddress', {}).get('address', '')
-            if email and email.lower() != my_email.lower() and email not in to_recipients:
+            if email and email.lower() != my_email.lower():
                 to_recipients.append(email)
+        
+        # Add original sender to CC
+        sender_email = from_addr.get('address')
+        if sender_email and sender_email.lower() != my_email.lower():
+            cc_recipients.append(sender_email)
         
         # Add all original CC recipients
         for recipient in original_msg.get('ccRecipients', []):
             email = recipient.get('emailAddress', {}).get('address', '')
-            if email and email.lower() != my_email.lower():
+            if email and email.lower() != my_email.lower() and email not in cc_recipients:
                 cc_recipients.append(email)
+    else:
+        # Regular reply: only to the sender
+        to_recipients = [from_addr.get('address')]
     
     # Build email body with history
     if include_history and body_type == "html":
@@ -516,6 +532,7 @@ def reply_email(
         body=full_body,
         cc=cc_recipients if cc_recipients else None,
         body_type=body_type,
+        importance=importance,
         token=token
     )
 
@@ -988,6 +1005,7 @@ def main():
     reply_parser.add_argument("message_id", help="Message ID to reply to")
     reply_parser.add_argument("--body", required=True, help="Reply body")
     reply_parser.add_argument("--all", dest="reply_all", action="store_true", help="Reply to all")
+    reply_parser.add_argument("--importance", choices=["low", "normal", "high"], help="Email importance level")
     
     # Forward command
     forward_parser = subparsers.add_parser("forward", help="Forward an email")
@@ -1113,7 +1131,8 @@ def main():
             reply_email(
                 message_id=args.message_id,
                 body=args.body,
-                reply_all=args.reply_all
+                reply_all=args.reply_all,
+                importance=getattr(args, 'importance', None)
             )
             if args.json:
                 print(json.dumps({"success": True, "message": "Reply sent successfully"}))
