@@ -23,21 +23,19 @@ pip install -r requirements.txt
 ### 1. Authentication
 
 ```bash
-# Start login flow - will display URL and code
-python scripts/auth.py --start
-
-# After entering the code in browser, complete authentication
-python scripts/auth.py --complete
-
-# Check authentication status
+# Check authentication status (auto-refreshes token if needed)
 python scripts/auth.py --status
 
-# Refresh token
-python scripts/auth.py --refresh
+# If not authenticated, start login flow
+python scripts/auth.py --start
+# Visit the URL and enter the code, then:
+python scripts/auth.py --complete
 
 # Logout
 python scripts/auth.py --logout
 ```
+
+**Note:** Tokens auto-refresh via `--status`. Manual `--refresh` is optional.
 
 ### 2. Email Operations
 
@@ -167,7 +165,7 @@ Tokens are cached locally in `~/.ms_graph_skill/`:
 
 ### Token Refresh
 
-Access tokens expire after ~1 hour. The skill automatically refreshes tokens using the refresh token when needed. Refresh tokens are valid for 14-90 days depending on Azure AD configuration.
+Access tokens expire after ~1 hour. The skill automatically refreshes tokens when running `--status` or any API operation. Refresh tokens are valid for 14-90 days depending on Azure AD configuration.
 
 ## API Permissions
 
@@ -224,9 +222,10 @@ python scripts/auth.py --complete
 
 ### Token expired
 
-Refresh the token:
+Tokens auto-refresh when running `--status`. If refresh fails, re-login:
 ```bash
-python scripts/auth.py --refresh
+python scripts/auth.py --start
+python scripts/auth.py --complete
 ```
 
 ### "InefficientFilter" error
