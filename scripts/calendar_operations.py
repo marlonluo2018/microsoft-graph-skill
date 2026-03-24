@@ -343,12 +343,20 @@ def update_event(
 # DELETE EVENT
 # =============================================================================
 
-def delete_event(event_id: str, token: str = None) -> bool:
+def delete_event(event_id: str, permanent: bool = False, token: str = None) -> bool:
     """
     Delete a calendar event.
     
+    Default behavior (soft delete): Moves event to "Deleted Items" folder.
+    Can be recovered from there. Does NOT notify attendees.
+    
+    Permanent delete: Permanently removes the event. Cannot be recovered.
+    
+    Note: To cancel an event and notify attendees (as organizer), use cancel_event() instead.
+    
     Args:
         event_id: Event ID to delete
+        permanent: If True, permanently delete (default False = soft delete)
         token: Access token
     
     Returns:
@@ -357,12 +365,288 @@ def delete_event(event_id: str, token: str = None) -> bool:
     if token is None:
         token = get_access_token()
     
-    url = f"{GRAPH_API_BASE}/me/events/{event_id}"
+    if permanent:
+        # Permanent delete - cannot be recovered
+        url = f"{GRAPH_API_BASE}/me/events/{event_id}"
+        response = requests.delete(url, headers=get_headers(token))
+        if response.status_code != 204:
+            raise Exception(f"Failed to permanently delete event: {response.status_code} - {response.text}")
+    else:
+        # Soft delete - move to Deleted Items folder
+        url = f"{GRAPH_API_BASE}/me/events/{event_id}/move"
+        payload = {
+            "destinationId": "deleteditems"
+        }
+        response = requests.post(url, headers=get_headers(token), json=payload)
+        if response.status_code not in [200, 201]:
+            raise Exception(f"Failed to soft delete event: {response.status_code} - {response.text}")
     
-    response = requests.delete(url, headers=get_headers(token))
+    return True
+
+
+# =============================================================================
+# ACCEPT EVENT
+# =============================================================================
+
+def accept_event(
+    event_id: str,
+    comment: str = None,
+    send_response: bool = True,
+    token: str = None
+) -> bool:
+    """
+    Accept a calendar event invitation.
     
-    if response.status_code != 204:
-        raise Exception(f"Failed to delete event: {response.status_code} - {response.text}")
+    Args:
+        event_id: Event ID to accept
+        comment: Optional comment to include in response
+        send_response: Whether to send response to organizer (default True)
+        token: Access token
+    
+    Returns:
+        bool: True if successful
+    """
+    if token is None:
+        token = get_access_token()
+    
+    url = f"{GRAPH_API_BASE}/me/events/{event_id}/accept"
+    
+    payload = {}
+    if comment:
+        payload["comment"] = comment
+    if not send_response:
+        payload["sendResponse"] = False
+    
+    response = requests.post(url, headers=get_headers(token), json=payload)
+    
+    if response.status_code not in [200, 202]:
+        raise Exception(f"Failed to accept event: {response.status_code} - {response.text}")
+    
+    return True
+
+
+# =============================================================================
+# DECLINE EVENT
+# =============================================================================
+
+def decline_event(
+    event_id: str,
+    comment: str = None,
+    send_response: bool = True,
+    token: str = None
+) -> bool:
+    """
+    Decline a calendar event invitation.
+    
+    Args:
+        event_id: Event ID to decline
+        comment: Optional comment to include in response
+        send_response: Whether to send response to organizer (default True)
+        token: Access token
+    
+    Returns:
+        bool: True if successful
+    """
+    if token is None:
+        token = get_access_token()
+    
+    url = f"{GRAPH_API_BASE}/me/events/{event_id}/decline"
+    
+    payload = {}
+    if comment:
+        payload["comment"] = comment
+    if not send_response:
+        payload["sendResponse"] = False
+    
+    response = requests.post(url, headers=get_headers(token), json=payload)
+    
+    if response.status_code not in [200, 202]:
+        raise Exception(f"Failed to decline event: {response.status_code} - {response.text}")
+    
+    return True
+
+
+# =============================================================================
+# TENTATIVELY ACCEPT EVENT
+# =============================================================================
+
+def tentatively_accept_event(
+    event_id: str,
+    comment: str = None,
+    send_response: bool = True,
+    token: str = None
+) -> bool:
+    """
+    Tentatively accept a calendar event invitation.
+    
+    Args:
+        event_id: Event ID to tentatively accept
+        comment: Optional comment to include in response
+        send_response: Whether to send response to organizer (default True)
+        token: Access token
+    
+    Returns:
+        bool: True if successful
+    """
+    if token is None:
+        token = get_access_token()
+    
+    url = f"{GRAPH_API_BASE}/me/events/{event_id}/tentativelyAccept"
+    
+    payload = {}
+    if comment:
+        payload["comment"] = comment
+    if not send_response:
+        payload["sendResponse"] = False
+    
+    response = requests.post(url, headers=get_headers(token), json=payload)
+    
+    if response.status_code not in [200, 202]:
+        raise Exception(f"Failed to tentatively accept event: {response.status_code} - {response.text}")
+    
+    return True
+
+
+# =============================================================================
+# CANCEL EVENT (with notification to attendees)
+# =============================================================================
+
+def cancel_event(
+    event_id: str,
+    comment: str = None,
+    token: str = None
+) -> bool:
+    """
+    Cancel a calendar event and send cancellation notifications to attendees.
+    Only the organizer can cancel an event.
+    
+    Args:
+        event_id: Event ID to cancel
+        comment: Optional cancellation message to send to attendees
+        token: Access token
+    
+    Returns:
+        bool: True if successful
+    """
+    if token is None:
+        token = get_access_token()
+    
+    url = f"{GRAPH_API_BASE}/me/events/{event_id}/cancel"
+    
+    payload = {}
+    if comment:
+        payload["comment"] = comment
+    
+    response = requests.post(url, headers=get_headers(token), json=payload)
+    
+    if response.status_code not in [200, 202, 204]:
+        raise Exception(f"Failed to cancel event: {response.status_code} - {response.text}")
+    
+    return True
+
+
+# =============================================================================
+# FORWARD EVENT
+# =============================================================================
+
+def forward_event(
+    event_id: str,
+    to_emails: List[str],
+    comment: str = None,
+    token: str = None
+) -> bool:
+    """
+    Forward a calendar event to new recipients (adds them as optional attendees).
+    
+    Args:
+        event_id: Event ID to forward
+        to_emails: List of email addresses to forward to
+        comment: Optional message to include
+        token: Access token
+    
+    Returns:
+        bool: True if successful
+    """
+    if token is None:
+        token = get_access_token()
+    
+    url = f"{GRAPH_API_BASE}/me/events/{event_id}/forward"
+    
+    payload = {
+        "toRecipients": [
+            {
+                "emailAddress": {
+                    "address": email
+                }
+            }
+            for email in to_emails
+        ]
+    }
+    if comment:
+        payload["comment"] = comment
+    
+    response = requests.post(url, headers=get_headers(token), json=payload)
+    
+    if response.status_code not in [200, 202, 204]:
+        raise Exception(f"Failed to forward event: {response.status_code} - {response.text}")
+    
+    return True
+
+
+# =============================================================================
+# PROPOSE NEW TIME
+# =============================================================================
+
+def propose_new_time(
+    event_id: str,
+    new_start: str,
+    new_end: str,
+    timezone: str = "UTC",
+    comment: str = None,
+    send_response: bool = True,
+    token: str = None
+) -> bool:
+    """
+    Propose a new meeting time for an event (declines current time and proposes new).
+    
+    Args:
+        event_id: Event ID
+        new_start: Proposed new start datetime
+        new_end: Proposed new end datetime
+        timezone: Timezone (default UTC)
+        comment: Optional message to organizer
+        send_response: Whether to send response to organizer (default True)
+        token: Access token
+    
+    Returns:
+        bool: True if successful
+    """
+    if token is None:
+        token = get_access_token()
+    
+    url = f"{GRAPH_API_BASE}/me/events/{event_id}/decline"
+    
+    payload = {
+        "proposedNewTime": {
+            "start": {
+                "dateTime": parse_datetime(new_start),
+                "timeZone": timezone
+            },
+            "end": {
+                "dateTime": parse_datetime(new_end),
+                "timeZone": timezone
+            }
+        }
+    }
+    if comment:
+        payload["comment"] = comment
+    if not send_response:
+        payload["sendResponse"] = False
+    
+    response = requests.post(url, headers=get_headers(token), json=payload)
+    
+    if response.status_code not in [200, 202]:
+        raise Exception(f"Failed to propose new time: {response.status_code} - {response.text}")
     
     return True
 
@@ -425,21 +709,27 @@ def suggest_meeting_times(
     start: str = None,
     end: str = None,
     timezone: str = "UTC",
+    top_n: int = 5,
+    interval: int = 30,
     token: str = None
-) -> List[Dict[str, Any]]:
+) -> Dict[str, Any]:
     """
-    Suggest available meeting times based on attendee availability.
+    Suggest optimal meeting times based on attendee availability.
+    
+    Intelligently analyzes free/busy data and returns ranked time slots.
     
     Args:
         attendees: List of attendee email addresses
-        duration_minutes: Required meeting duration
-        start: Search start datetime
-        end: Search end datetime
-        timezone: Timezone
+        duration_minutes: Required meeting duration (default 60)
+        start: Search start datetime (default: now)
+        end: Search end datetime (default: 7 days from now)
+        timezone: Timezone for results (default UTC)
+        top_n: Number of top slots to return (default 5)
+        interval: Time slot interval in minutes (default 30)
         token: Access token
     
     Returns:
-        List of suggested meeting time slots
+        Dict with top_time_slots ranked by score, plus detailed availability info
     """
     if token is None:
         token = get_access_token()
@@ -449,6 +739,9 @@ def suggest_meeting_times(
         start = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     if end is None:
         end = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
+    
+    # Parse start datetime to get reference point
+    start_dt = datetime.fromisoformat(start.replace("Z", "+00:00").replace("+00:00", ""))
     
     url = f"{GRAPH_API_BASE}/me/calendar/getschedule"
     
@@ -462,7 +755,7 @@ def suggest_meeting_times(
             "dateTime": parse_datetime(end),
             "timeZone": timezone
         },
-        "availabilityViewInterval": 30
+        "availabilityViewInterval": interval
     }
     
     response = requests.post(url, headers=get_headers(token), json=payload)
@@ -470,11 +763,153 @@ def suggest_meeting_times(
     if response.status_code != 200:
         raise Exception(f"Failed to get suggestions: {response.status_code} - {response.text}")
     
-    # Parse and analyze availability
     data = response.json()
-    # TODO: Implement intelligent time slot suggestion based on availability data
+    availability_data = data.get("value", [])
     
-    return data
+    # Track free status for each slot
+    # Key: slot_index, Value: set of free attendee emails
+    slot_free_status = {}  # {slot_index: set(free_emails)}
+    slot_busy_status = {}  # {slot_index: [(email, status), ...]}
+    
+    for attendee_info in availability_data:
+        email = attendee_info.get("scheduleId", "unknown")
+        availability_view = attendee_info.get("availabilityView", "")
+        schedule_items = attendee_info.get("scheduleItems", [])
+        
+        # Parse availability view string
+        for i, status_code in enumerate(availability_view):
+            if i not in slot_free_status:
+                slot_free_status[i] = set()
+                slot_busy_status[i] = []
+            
+            if status_code == "0":  # Free
+                slot_free_status[i].add(email)
+            else:
+                status_map = {
+                    "1": "Tentative",
+                    "2": "Busy",
+                    "3": "Out of Office",
+                    "4": "Working Elsewhere",
+                    "?": "Unknown"
+                }
+                slot_busy_status[i].append({
+                    "email": email,
+                    "status": status_map.get(status_code, "Unknown")
+                })
+    
+    if not slot_free_status:
+        return {
+            "success": True,
+            "search_range": {"start": start, "end": end},
+            "timezone": timezone,
+            "duration_minutes": duration_minutes,
+            "total_attendees": len(attendees),
+            "top_time_slots": [],
+            "message": "No availability data found"
+        }
+    
+    # Find continuous free slots that fit the meeting duration
+    required_slots = max(1, duration_minutes // interval)
+    total_attendees = len(attendees)
+    
+    def score_slot(free_count, total, has_tentative=False):
+        """Score a time slot based on availability."""
+        # Base score: percentage of free attendees (0-100)
+        if total > 0:
+            base_score = (free_count / total) * 100
+        else:
+            base_score = 100
+        
+        # Bonus for all attendees free (+30)
+        all_free_bonus = 30 if free_count == total else 0
+        
+        # Penalty for tentative events (-10)
+        tentative_penalty = -10 if has_tentative else 0
+        
+        return base_score + all_free_bonus + tentative_penalty
+    
+    meeting_slots = []
+    max_slot_index = max(slot_free_status.keys())
+    
+    # Slide through slots to find continuous windows
+    for i in range(max_slot_index + 1):
+        if i + required_slots > max_slot_index + 1:
+            break
+        
+        # Check if all required slots exist and are continuous
+        slots_valid = True
+        free_intersection = set(attendees)  # Start with all attendees
+        has_tentative = False
+        all_busy_info = []
+        
+        for j in range(required_slots):
+            slot_idx = i + j
+            if slot_idx not in slot_free_status:
+                slots_valid = False
+                break
+            
+            # Intersect free attendees
+            free_intersection = free_intersection & slot_free_status[slot_idx]
+            
+            # Check for tentative status
+            for busy_info in slot_busy_status.get(slot_idx, []):
+                all_busy_info.append(busy_info)
+                if busy_info["status"] == "Tentative":
+                    has_tentative = True
+        
+        if not slots_valid:
+            continue
+        
+        # Calculate score
+        free_count = len(free_intersection)
+        score = score_slot(free_count, total_attendees, has_tentative)
+        
+        # Calculate actual time
+        slot_start = start_dt + timedelta(minutes=i * interval)
+        slot_end = slot_start + timedelta(minutes=duration_minutes)
+        
+        # Build unavailable attendees list
+        unavailable = []
+        for email in attendees:
+            if email not in free_intersection:
+                # Find their status
+                status = "Busy"
+                for busy_info in all_busy_info:
+                    if busy_info["email"] == email:
+                        status = busy_info["status"]
+                        break
+                unavailable.append({"email": email, "status": status})
+        
+        meeting_slots.append({
+            "start": slot_start.strftime("%Y-%m-%d %H:%M"),
+            "end": slot_end.strftime("%Y-%m-%d %H:%M"),
+            "score": round(score, 1),
+            "free_attendees": list(free_intersection),
+            "free_count": free_count,
+            "total_attendees": total_attendees,
+            "all_free": free_count == total_attendees,
+            "unavailable_attendees": unavailable
+        })
+    
+    # Sort by score (descending), then by start time
+    meeting_slots.sort(key=lambda x: (-x["score"], x["start"]))
+    
+    # Return top N slots
+    top_slots = meeting_slots[:top_n]
+    
+    # Add rank
+    for i, slot in enumerate(top_slots):
+        slot["rank"] = i + 1
+    
+    return {
+        "success": True,
+        "search_range": {"start": start, "end": end},
+        "timezone": timezone,
+        "duration_minutes": duration_minutes,
+        "total_attendees": total_attendees,
+        "top_time_slots": top_slots,
+        "raw_availability": availability_data  # Include raw data for debugging
+    }
 
 
 # =============================================================================
@@ -669,8 +1104,9 @@ def main():
     update_parser.add_argument("--location", help="New location")
     
     # Delete command
-    delete_parser = subparsers.add_parser("delete", help="Delete an event")
+    delete_parser = subparsers.add_parser("delete", help="Soft delete an event (move to Deleted Items)")
     delete_parser.add_argument("event_id", help="Event ID")
+    delete_parser.add_argument("--permanent", action="store_true", help="Permanently delete (cannot recover)")
     
     # Availability command
     avail_parser = subparsers.add_parser("availability", help="Get availability")
@@ -678,6 +1114,52 @@ def main():
     avail_parser.add_argument("--start", required=True, help="Start datetime")
     avail_parser.add_argument("--end", required=True, help="End datetime")
     avail_parser.add_argument("--timezone", default="UTC", help="Timezone")
+    
+    # Accept command
+    accept_parser = subparsers.add_parser("accept", help="Accept an event invitation")
+    accept_parser.add_argument("event_id", help="Event ID")
+    accept_parser.add_argument("--comment", help="Optional comment")
+    accept_parser.add_argument("--no-send", action="store_true", help="Don't send response to organizer")
+    
+    # Decline command
+    decline_parser = subparsers.add_parser("decline", help="Decline an event invitation")
+    decline_parser.add_argument("event_id", help="Event ID")
+    decline_parser.add_argument("--comment", help="Optional comment")
+    decline_parser.add_argument("--no-send", action="store_true", help="Don't send response to organizer")
+    
+    # Tentatively accept command
+    tentative_parser = subparsers.add_parser("tentative", help="Tentatively accept an event invitation")
+    tentative_parser.add_argument("event_id", help="Event ID")
+    tentative_parser.add_argument("--comment", help="Optional comment")
+    tentative_parser.add_argument("--no-send", action="store_true", help="Don't send response to organizer")
+    
+    # Cancel command (organizer only)
+    cancel_parser = subparsers.add_parser("cancel", help="Cancel an event (organizer only, sends notifications)")
+    cancel_parser.add_argument("event_id", help="Event ID")
+    cancel_parser.add_argument("--comment", help="Cancellation message to attendees")
+    
+    # Forward command
+    forward_parser = subparsers.add_parser("forward", help="Forward an event to new recipients")
+    forward_parser.add_argument("event_id", help="Event ID")
+    forward_parser.add_argument("--to", required=True, dest="to_emails", help="Email addresses (comma-separated)")
+    forward_parser.add_argument("--comment", help="Optional message")
+    
+    # Suggest meeting times command
+    suggest_parser = subparsers.add_parser("suggest", help="Suggest optimal meeting times based on attendee availability")
+    suggest_parser.add_argument("--attendees", required=True, help="Attendee emails (comma-separated)")
+    suggest_parser.add_argument("--duration", type=int, default=60, help="Meeting duration in minutes (default 60)")
+    suggest_parser.add_argument("--start", help="Search start datetime (default: now)")
+    suggest_parser.add_argument("--end", help="Search end datetime (default: 7 days)")
+    suggest_parser.add_argument("--timezone", default="UTC", help="Timezone (default UTC)")
+    suggest_parser.add_argument("--top", type=int, default=5, help="Number of top slots to show (default 5)")
+    
+    # Propose new time command
+    propose_parser = subparsers.add_parser("propose", help="Propose a new meeting time")
+    propose_parser.add_argument("event_id", help="Event ID")
+    propose_parser.add_argument("--start", required=True, help="Proposed new start datetime")
+    propose_parser.add_argument("--end", required=True, help="Proposed new end datetime")
+    propose_parser.add_argument("--timezone", default="UTC", help="Timezone")
+    propose_parser.add_argument("--comment", help="Optional message to organizer")
     
     # List calendars command
     subparsers.add_parser("calendars", help="List all calendars")
@@ -745,11 +1227,13 @@ def main():
                 print(f"✓ Event updated")
         
         elif args.command == "delete":
-            delete_event(args.event_id)
+            delete_event(args.event_id, permanent=args.permanent)
             if args.json:
-                print(json.dumps({"success": True, "message": "Event deleted"}))
+                msg = "Event permanently deleted" if args.permanent else "Event moved to Deleted Items"
+                print(json.dumps({"success": True, "message": msg}))
             else:
-                print("✓ Event deleted")
+                msg = "✓ Event permanently deleted" if args.permanent else "✓ Event moved to Deleted Items (soft delete)"
+                print(msg)
         
         elif args.command == "availability":
             data = get_availability(
@@ -771,6 +1255,101 @@ def main():
                 print(f"\nCalendars ({len(calendars)}):")
                 for cal in calendars:
                     print(f"  - {cal.get('name', 'Unknown')} (ID: {cal.get('id')})")
+        
+        elif args.command == "accept":
+            accept_event(
+                event_id=args.event_id,
+                comment=args.comment,
+                send_response=not args.no_send
+            )
+            if args.json:
+                print(json.dumps({"success": True, "message": "Event accepted"}))
+            else:
+                print("✓ Event accepted")
+        
+        elif args.command == "decline":
+            decline_event(
+                event_id=args.event_id,
+                comment=args.comment,
+                send_response=not args.no_send
+            )
+            if args.json:
+                print(json.dumps({"success": True, "message": "Event declined"}))
+            else:
+                print("✓ Event declined")
+        
+        elif args.command == "tentative":
+            tentatively_accept_event(
+                event_id=args.event_id,
+                comment=args.comment,
+                send_response=not args.no_send
+            )
+            if args.json:
+                print(json.dumps({"success": True, "message": "Event tentatively accepted"}))
+            else:
+                print("✓ Event tentatively accepted")
+        
+        elif args.command == "cancel":
+            cancel_event(
+                event_id=args.event_id,
+                comment=args.comment
+            )
+            if args.json:
+                print(json.dumps({"success": True, "message": "Event cancelled, notifications sent to attendees"}))
+            else:
+                print("✓ Event cancelled, notifications sent to attendees")
+        
+        elif args.command == "forward":
+            forward_event(
+                event_id=args.event_id,
+                to_emails=parse_email_list(args.to_emails),
+                comment=args.comment
+            )
+            if args.json:
+                print(json.dumps({"success": True, "message": f"Event forwarded to {len(parse_email_list(args.to_emails))} recipient(s)"}))
+            else:
+                print(f"✓ Event forwarded to {len(parse_email_list(args.to_emails))} recipient(s)")
+        
+        elif args.command == "propose":
+            propose_new_time(
+                event_id=args.event_id,
+                new_start=args.start,
+                new_end=args.end,
+                timezone=args.timezone,
+                comment=args.comment
+            )
+            if args.json:
+                print(json.dumps({"success": True, "message": f"New time proposed: {args.start} - {args.end}"}))
+            else:
+                print(f"✓ New time proposed: {args.start} - {args.end}")
+        
+        elif args.command == "suggest":
+            result = suggest_meeting_times(
+                attendees=parse_email_list(args.attendees),
+                duration_minutes=args.duration,
+                start=args.start,
+                end=args.end,
+                timezone=args.timezone,
+                top_n=args.top
+            )
+            if args.json:
+                # Remove raw_availability for cleaner JSON output
+                output = {k: v for k, v in result.items() if k != "raw_availability"}
+                print(json.dumps(output, indent=2, default=str))
+            else:
+                print(f"\n📅 Suggested Meeting Times (duration: {args.duration}min)")
+                print(f"   Attendees: {', '.join(parse_email_list(args.attendees))}")
+                print(f"   Timezone: {args.timezone}")
+                print()
+                if result["top_time_slots"]:
+                    for slot in result["top_time_slots"]:
+                        all_free = "✓ All free" if slot["all_free"] else f"{slot['free_count']}/{slot['total_attendees']} free"
+                        print(f"   #{slot['rank']} {slot['start']} - {slot['end']} (Score: {slot['score']}) - {all_free}")
+                        if slot["unavailable_attendees"]:
+                            for u in slot["unavailable_attendees"]:
+                                print(f"       - {u['email']}: {u['status']}")
+                else:
+                    print("   No suitable time slots found")
     
     except Exception as e:
         if args.json:

@@ -19,6 +19,7 @@ import sys
 import json
 import argparse
 import csv
+import time
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from datetime import datetime
@@ -57,6 +58,76 @@ def get_headers(token: str) -> Dict[str, str]:
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
+
+
+def api_request(
+    method: str,
+    url: str,
+    token: str = None,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    **kwargs
+) -> "requests.Response":
+    """
+    Make an API request with automatic retry on rate limiting (429).
+    
+    Args:
+        method: HTTP method ('get', 'post', or 'patch')
+        url: API endpoint URL
+        token: Access token (will obtain if not provided)
+        max_retries: Maximum number of retries for 429 errors
+        base_delay: Base delay in seconds for exponential backoff
+        **kwargs: Additional arguments passed to requests
+        
+    Returns:
+        requests.Response object
+        
+    Raises:
+        Exception: If request fails after all retries
+    """
+    if token is None:
+        token = get_access_token()
+    
+    headers = kwargs.pop('headers', get_headers(token))
+    params = kwargs.pop('params', None)
+    json_data = kwargs.pop('json', None)
+    
+    for attempt in range(max_retries + 1):
+        if method.lower() == 'get':
+            response = requests.get(url, headers=headers, params=params, **kwargs)
+        elif method.lower() == 'post':
+            response = requests.post(url, headers=headers, json=json_data, params=params, **kwargs)
+        elif method.lower() == 'patch':
+            response = requests.patch(url, headers=headers, json=json_data, params=params, **kwargs)
+        else:
+            raise ValueError(f"Unsupported HTTP method: {method}")
+        
+        # Check for rate limiting
+        if response.status_code == 429:
+            if attempt < max_retries:
+                # Get retry-after header or use exponential backoff
+                retry_after = response.headers.get('Retry-After')
+                if retry_after:
+                    delay = float(retry_after)
+                else:
+                    delay = base_delay * (2 ** attempt)  # Exponential backoff
+                
+                print(f"⚠️ Rate limited (429). Retrying in {delay:.1f}s... (attempt {attempt + 1}/{max_retries})")
+                time.sleep(delay)
+                continue
+            else:
+                raise Exception(
+                    f"Rate limit exceeded after {max_retries} retries. "
+                    f"Please wait a few minutes before trying again."
+                )
+        
+        # For other errors, raise immediately
+        if response.status_code >= 400:
+            raise Exception(f"API request failed: {response.status_code} - {response.text}")
+        
+        return response
+    
+    raise Exception("Unexpected error in api_request")
 
 
 def validate_recipients(to: List[str], cc: List[str] = None, bcc: List[str] = None) -> bool:
@@ -103,6 +174,78 @@ def parse_email_list(emails: str) -> List[str]:
     # Support both comma and semicolon separators
     emails = emails.replace(';', ',')
     return [e.strip() for e in emails.split(',') if e.strip()]
+
+
+def detect_outlook_syntax(value: str, param_name: str) -> tuple:
+    """
+    Detect and convert Outlook search syntax to CLI parameters.
+    
+    Outlook syntax: "from:beng", "to:john@example.com", "subject:meeting"
+    Returns: (converted_value, warning_message)
+    
+    Examples:
+        detect_outlook_syntax("from:beng", "--from") -> ("beng", "⚠️  Auto-converted 'from:beng' -> --from 'beng'")
+        detect_outlook_syntax("beng", "--from") -> ("beng", None)
+    """
+    if not value or ':' not in value:
+        return value, None
+    
+    # Outlook syntax patterns
+    outlook_patterns = {
+        'from': 'from_sender',
+        'to': 'to_recipient',
+        'subject': 'subject',
+        'body': 'body',
+    }
+    
+    # Check if value matches Outlook syntax
+    for pattern, target_param in outlook_patterns.items():
+        if value.lower().startswith(f"{pattern}:"):
+            # Extract the actual value
+            actual_value = value[len(pattern)+1:].strip()
+            # Remove surrounding quotes if present
+            if actual_value.startswith('"') and actual_value.endswith('"'):
+                actual_value = actual_value[1:-1]
+            if actual_value.startswith("'") and actual_value.endswith("'"):
+                actual_value = actual_value[1:-1]
+            
+            # Check if the detected param matches the CLI param
+            if param_name.replace('--', '').replace('_', '') in [target_param, pattern]:
+                warning = f"⚠️  Auto-converted Outlook syntax: '{value}' -> {param_name} '{actual_value}'"
+                return actual_value, warning
+            else:
+                # User used wrong param, but we detected what they meant
+                warning = f"⚠️  Detected Outlook syntax in {param_name}: '{value}'"
+                warning += f"\n   💡 Did you mean --{pattern} '{actual_value}'?"
+                return value, warning
+    
+    return value, None
+
+
+def convert_outlook_syntax_args(args) -> list:
+    """
+    Process args and convert any Outlook syntax found.
+    Returns list of warning messages.
+    """
+    warnings = []
+    
+    params_to_check = [
+        ('from_sender', '--from'),
+        ('to_recipient', '--to'),
+        ('subject', '--subject'),
+        ('body', '--body'),
+    ]
+    
+    for attr, param_name in params_to_check:
+        value = getattr(args, attr, None)
+        if value:
+            converted, warning = detect_outlook_syntax(value, param_name)
+            if converted != value:
+                setattr(args, attr, converted)
+            if warning:
+                warnings.append(warning)
+    
+    return warnings
 
 
 # =============================================================================
@@ -239,10 +382,7 @@ def list_messages(
     if filters:
         params["$filter"] = " and ".join(filters)
     
-    response = requests.get(url, headers=get_headers(token), params=params)
-    
-    if response.status_code != 200:
-        raise Exception(f"Failed to list messages: {response.status_code} - {response.text}")
+    response = api_request('get', url, token, params=params)
     
     data = response.json()
     messages = data.get("value", [])
@@ -303,10 +443,7 @@ def get_message(message_id: str, token: str = None) -> Dict[str, Any]:
     
     url = f"{GRAPH_API_BASE}/me/messages/{message_id}"
     
-    response = requests.get(url, headers=get_headers(token))
-    
-    if response.status_code != 200:
-        raise Exception(f"Failed to get message: {response.status_code} - {response.text}")
+    response = api_request('get', url, token)
     
     return response.json()
 
@@ -383,10 +520,7 @@ def send_email(
     
     url = f"{GRAPH_API_BASE}/me/sendMail"
     
-    response = requests.post(url, headers=get_headers(token), json=payload)
-    
-    if response.status_code != 202:
-        raise Exception(f"Failed to send email: {response.status_code} - {response.text}")
+    response = api_request('post', url, token, json=payload)
     
     return True
 
@@ -907,10 +1041,7 @@ def get_my_email(token: str = None) -> str:
         token = get_access_token()
     
     url = f"{GRAPH_API_BASE}/me"
-    response = requests.get(url, headers=get_headers(token))
-    
-    if response.status_code != 200:
-        return ""
+    response = api_request('get', url, token)
     
     data = response.json()
     return data.get('mail', '') or data.get('userPrincipalName', '')
@@ -968,6 +1099,9 @@ def forward_email(
     # Convert plain text comment to HTML if needed
     # Graph API forward expects HTML in comment field
     if comment:
+        # First, convert literal \n strings to actual newlines (for CLI convenience)
+        comment = comment.replace('\\n', '\n')
+        
         if body_type == "html" and not comment.strip().startswith('<'):
             # Convert plain text to HTML with proper line breaks
             comment = comment.replace('\n', '<br>\n')
@@ -989,10 +1123,7 @@ def forward_email(
         payload["bccRecipients"] = bcc_recipients
     
     # Send forward request
-    response = requests.post(url, headers=get_headers(token), json=payload)
-    
-    if response.status_code not in [200, 201, 202]:
-        raise Exception(f"Failed to forward email: {response.status_code} - {response.text}")
+    response = api_request('post', url, token, json=payload)
     
     return True
 
@@ -1180,10 +1311,7 @@ def mark_as_unread(message_id: str, token: str = None) -> bool:
     
     payload = {"isRead": False}
     
-    response = requests.patch(url, headers=get_headers(token), json=payload)
-    
-    if response.status_code != 200:
-        raise Exception(f"Failed to mark as unread: {response.status_code} - {response.text}")
+    response = api_request('patch', url, token, json=payload)
     
     return True
 
@@ -1208,10 +1336,7 @@ def get_message_thread(message_id: str, token: str = None) -> List[Dict[str, Any
     
     # First get the message with conversation ID and subject
     url = f"{GRAPH_API_BASE}/me/messages/{message_id}?$select=conversationId,subject"
-    response = requests.get(url, headers=get_headers(token))
-    
-    if response.status_code != 200:
-        raise Exception(f"Failed to get message: {response.status_code} - {response.text}")
+    response = api_request('get', url, token)
     
     message = response.json()
     conversation_id = message.get('conversationId')
@@ -1236,10 +1361,7 @@ def get_message_thread(message_id: str, token: str = None) -> List[Dict[str, Any
         "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,body,conversationId,internetMessageId"
     }
     
-    response = requests.get(url, headers=get_headers(token), params=params)
-    
-    if response.status_code != 200:
-        raise Exception(f"Failed to get thread: {response.status_code} - {response.text}")
+    response = api_request('get', url, token, params=params)
     
     # Filter to only messages in the same conversation
     all_messages = response.json().get("value", [])
@@ -1322,6 +1444,66 @@ def delete_email(message_id: str, token: str = None) -> bool:
         raise Exception(f"Failed to delete email: {response.status_code} - {response.text}")
     
     return True
+
+
+# =============================================================================
+# LIST MAIL FOLDERS
+# =============================================================================
+
+def list_mail_folders(
+    include_hidden: bool = False,
+    token: str = None
+) -> List[Dict[str, Any]]:
+    """
+    List all mail folders for the user.
+    
+    Args:
+        include_hidden: Include hidden folders
+        token: Access token
+    
+    Returns:
+        List of folder objects with id, displayName, totalItemCount, unreadItemCount
+    """
+    if token is None:
+        token = get_access_token()
+    
+    url = f"{GRAPH_API_BASE}/me/mailFolders"
+    
+    params = {
+        "$select": "id,displayName,totalItemCount,unreadItemCount,isHidden,childFolderCount"
+    }
+    
+    response = api_request('get', url, token, params=params)
+    
+    data = response.json()
+    folders = data.get("value", [])
+    
+    # Filter out hidden folders if not requested
+    if not include_hidden:
+        folders = [f for f in folders if not f.get('isHidden', False)]
+    
+    return folders
+
+
+def display_folder_list(folders: List[Dict]):
+    """Display a list of mail folders."""
+    print(f"\n{'='*100}")
+    print(f"{'Folder Name':<40} {'Total':<10} {'Unread':<10} {'ID':<40}")
+    print(f"{'='*100}")
+    
+    for folder in folders:
+        name = folder.get('displayName', 'Unknown')[:40]
+        total = folder.get('totalItemCount', 0)
+        unread = folder.get('unreadItemCount', 0)
+        folder_id = folder.get('id', '')[:40]
+        
+        unread_str = f"[{unread}]" if unread > 0 else ""
+        print(f"{name:<40} {total:<10} {unread_str:<10} {folder_id:<40}")
+    
+    print(f"{'='*100}")
+    print(f"Total: {len(folders)} folders")
+    print(f"\n💡 Tip: Use --folder <name> or --folder <ID> to search in a specific folder")
+    print(f"💡 Tip: Use --folder all to search across all folders")
 
 
 # =============================================================================
@@ -1496,13 +1678,20 @@ def main():
     search_parser.add_argument("--subject", help="Search by subject text")
     search_parser.add_argument("--body", help="Search by body text")
     
-    # Find command (search + display first result)
-    find_parser = subparsers.add_parser("find", help="Find and display a message (combines search + get)")
-    find_parser.add_argument("--from", dest="from_sender", help="Sender name or email")
-    find_parser.add_argument("--to", dest="to_recipient", help="Recipient name or email")
-    find_parser.add_argument("--subject", help="Subject contains")
-    find_parser.add_argument("--body", help="Body contains")
+    # Find command (complete alias for list, supports all parameters)
+    find_parser = subparsers.add_parser("find", help="Find/list messages (alias for list)")
     find_parser.add_argument("--folder", default="inbox", help="Folder name (or 'all' for all folders)")
+    find_parser.add_argument("--limit", "--top", type=int, default=25, dest="limit", help="Max messages to return (--top is alias)")
+    find_parser.add_argument("--filter", dest="filter_query", help="OData filter query")
+    find_parser.add_argument("--unread", action="store_true", help="Show unread only")
+    find_parser.add_argument("--preview", action="store_true", help="Show email body preview")
+    find_parser.add_argument("--focused", action="store_true", help="Show Focused inbox only")
+    find_parser.add_argument("--other", action="store_true", help="Show Other inbox only")
+    # Search parameters
+    find_parser.add_argument("--from", dest="from_sender", help="Search by sender name or email")
+    find_parser.add_argument("--to", dest="to_recipient", help="Search by recipient name or email")
+    find_parser.add_argument("--subject", help="Search by subject text")
+    find_parser.add_argument("--body", help="Search by body text")
     
     # Get command
     get_parser = subparsers.add_parser("get", help="Get a message")
@@ -1554,11 +1743,20 @@ def main():
     delete_parser = subparsers.add_parser("delete", help="Delete an email")
     delete_parser.add_argument("message_id", help="Message ID to delete")
     
+    # List folders command
+    folders_parser = subparsers.add_parser("folders", help="List all mail folders")
+    folders_parser.add_argument("--all", dest="include_hidden", action="store_true", help="Include hidden folders")
+    
     args = parser.parse_args()
     
+    # Auto-convert Outlook search syntax (e.g., "from:beng" -> --from "beng")
+    syntax_warnings = convert_outlook_syntax_args(args)
+    for warning in syntax_warnings:
+        print(warning)
+    
     try:
-        if args.command in ["list", "search"]:
-            # Unified handler for list and search commands (identical functionality)
+        if args.command in ["list", "search", "find"]:
+            # Unified handler for list, search and find commands (identical functionality)
             filter_query = args.filter_query
             if args.unread:
                 filter_query = (filter_query + " and " if filter_query else "") + "isRead eq false"
@@ -1585,49 +1783,6 @@ def main():
                 print(json.dumps({"success": True, "messages": messages, "total": len(messages)}, indent=2, default=str))
             else:
                 display_message_list(messages, show_preview=True)
-        
-        elif args.command == "find":
-            # Find uses list_messages with limit=1
-            try:
-                messages = list_messages(
-                    folder=args.folder,
-                    limit=1,
-                    from_sender=args.from_sender,
-                    to_recipient=args.to_recipient,
-                    subject=args.subject,
-                    body=args.body
-                )
-                if not messages:
-                    print("No matching messages found.")
-                    sys.exit(1)
-                
-                # Get full message details
-                message = get_message(messages[0]['id'])
-                if args.json:
-                    print(json.dumps({"success": True, "message": message}, indent=2, default=str))
-                else:
-                    display_message(message)
-            except Exception as e:
-                # Auto-fallback to list --preview if find fails (e.g., due to search indexing delays)
-                if "search" in str(e).lower() or "index" in str(e).lower():
-                    print("⚠️  Search API failed (likely due to indexing delays)")
-                    print("💡 Auto-falling back to list --preview...")
-                    print()
-                    messages = list_messages(
-                        folder=args.folder,
-                        limit=10,
-                        from_sender=args.from_sender,
-                        to_recipient=args.to_recipient,
-                        subject=args.subject,
-                        body=args.body,
-                        include_preview=True
-                    )
-                    if args.json:
-                        print(json.dumps({"success": True, "messages": messages, "total": len(messages)}, indent=2, default=str))
-                    else:
-                        display_message_list(messages, show_preview=True)
-                else:
-                    raise
         
         elif args.command == "get":
             message = get_message(args.message_id)
@@ -1762,6 +1917,13 @@ def main():
                 print(json.dumps({"success": True, "message": "Email deleted"}))
             else:
                 print("✓ Email deleted")
+        
+        elif args.command == "folders":
+            folders = list_mail_folders(include_hidden=getattr(args, 'include_hidden', False))
+            if args.json:
+                print(json.dumps({"success": True, "folders": folders, "total": len(folders)}, indent=2, default=str))
+            else:
+                display_folder_list(folders)
     
     except ValueError as e:
         if args.json:

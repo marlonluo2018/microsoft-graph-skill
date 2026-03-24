@@ -17,6 +17,7 @@ import os
 import sys
 import argparse
 import json
+import time
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
@@ -47,6 +48,76 @@ def get_headers(token: str) -> Dict[str, str]:
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
+
+
+def api_request(
+    method: str,
+    url: str,
+    token: str = None,
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    **kwargs
+) -> "requests.Response":
+    """
+    Make an API request with automatic retry on rate limiting (429).
+    
+    Args:
+        method: HTTP method ('get', 'post', or 'patch')
+        url: API endpoint URL
+        token: Access token (will obtain if not provided)
+        max_retries: Maximum number of retries for 429 errors
+        base_delay: Base delay in seconds for exponential backoff
+        **kwargs: Additional arguments passed to requests
+        
+    Returns:
+        requests.Response object
+        
+    Raises:
+        Exception: If request fails after all retries
+    """
+    if token is None:
+        token = get_access_token()
+    
+    headers = kwargs.pop('headers', get_headers(token))
+    params = kwargs.pop('params', None)
+    json_data = kwargs.pop('json', None)
+    
+    for attempt in range(max_retries + 1):
+        if method.lower() == 'get':
+            response = requests.get(url, headers=headers, params=params, **kwargs)
+        elif method.lower() == 'post':
+            response = requests.post(url, headers=headers, json=json_data, params=params, **kwargs)
+        elif method.lower() == 'patch':
+            response = requests.patch(url, headers=headers, json=json_data, params=params, **kwargs)
+        else:
+            raise ValueError(f"Unsupported HTTP method: {method}")
+        
+        # Check for rate limiting
+        if response.status_code == 429:
+            if attempt < max_retries:
+                # Get retry-after header or use exponential backoff
+                retry_after = response.headers.get('Retry-After')
+                if retry_after:
+                    delay = float(retry_after)
+                else:
+                    delay = base_delay * (2 ** attempt)  # Exponential backoff
+                
+                print(f"⚠️ Rate limited (429). Retrying in {delay:.1f}s... (attempt {attempt + 1}/{max_retries})")
+                time.sleep(delay)
+                continue
+            else:
+                raise Exception(
+                    f"Rate limit exceeded after {max_retries} retries. "
+                    f"Please wait a few minutes before trying again."
+                )
+        
+        # For other errors, raise immediately
+        if response.status_code >= 400:
+            raise Exception(f"API request failed: {response.status_code} - {response.text}")
+        
+        return response
+    
+    raise Exception("Unexpected error in api_request")
 
 
 # =============================================================================
@@ -107,10 +178,7 @@ def search_users(
         "$select": "id,displayName,mail,userPrincipalName,jobTitle,department,officeLocation,mobilePhone,businessPhones"
     }
     
-    response = requests.get(url, headers=get_headers(token), params=params)
-    
-    if response.status_code != 200:
-        raise Exception(f"Failed to search users: {response.status_code} - {response.text}")
+    response = api_request('get', url, token, params=params)
     
     data = response.json()
     users = data.get("value", [])
@@ -155,10 +223,7 @@ def list_users(
     if filter_query:
         params["$filter"] = filter_query
     
-    response = requests.get(url, headers=get_headers(token), params=params)
-    
-    if response.status_code != 200:
-        raise Exception(f"Failed to list users: {response.status_code} - {response.text}")
+    response = api_request('get', url, token, params=params)
     
     data = response.json()
     return data.get("value", [])
@@ -184,10 +249,7 @@ def get_user(user_id: str, token: str = None) -> Dict[str, Any]:
     
     url = f"{GRAPH_API_BASE}/users/{user_id}"
     
-    response = requests.get(url, headers=get_headers(token))
-    
-    if response.status_code != 200:
-        raise Exception(f"Failed to get user: {response.status_code} - {response.text}")
+    response = api_request('get', url, token)
     
     return response.json()
 
@@ -207,10 +269,7 @@ def get_me(token: str = None) -> Dict[str, Any]:
     
     url = f"{GRAPH_API_BASE}/me"
     
-    response = requests.get(url, headers=get_headers(token))
-    
-    if response.status_code != 200:
-        raise Exception(f"Failed to get current user: {response.status_code} - {response.text}")
+    response = api_request('get', url, token)
     
     return response.json()
 
@@ -238,12 +297,22 @@ def get_manager(user_id: str = None, token: str = None) -> Dict[str, Any]:
     else:
         url = f"{GRAPH_API_BASE}/me/manager"
     
-    response = requests.get(url, headers=get_headers(token))
-    
-    if response.status_code == 404:
-        return None  # No manager assigned
-    elif response.status_code != 200:
-        raise Exception(f"Failed to get manager: {response.status_code} - {response.text}")
+    # Special handling: 404 is expected when user has no manager
+    max_retries = 3
+    for attempt in range(max_retries + 1):
+        response = requests.get(url, headers=get_headers(token))
+        
+        if response.status_code == 429 and attempt < max_retries:
+            delay = 1.0 * (2 ** attempt)
+            print(f"⚠️ Rate limited (429). Retrying in {delay:.1f}s...")
+            time.sleep(delay)
+            continue
+        
+        if response.status_code == 404:
+            return None  # No manager assigned
+        elif response.status_code != 200:
+            raise Exception(f"Failed to get manager: {response.status_code} - {response.text}")
+        break
     
     return response.json()
 
@@ -275,10 +344,7 @@ def get_direct_reports(user_id: str = None, token: str = None) -> List[Dict[str,
         "$select": "id,displayName,mail,userPrincipalName,jobTitle,department"
     }
     
-    response = requests.get(url, headers=get_headers(token), params=params)
-    
-    if response.status_code != 200:
-        raise Exception(f"Failed to get direct reports: {response.status_code} - {response.text}")
+    response = api_request('get', url, token, params=params)
     
     data = response.json()
     return data.get("value", [])
@@ -317,10 +383,7 @@ def list_contacts(
         "$select": "id,displayName,emailAddresses,mobilePhone,companyName"
     }
     
-    response = requests.get(url, headers=get_headers(token), params=params)
-    
-    if response.status_code != 200:
-        raise Exception(f"Failed to list contacts: {response.status_code} - {response.text}")
+    response = api_request('get', url, token, params=params)
     
     data = response.json()
     return data.get("value", [])
@@ -355,10 +418,7 @@ def search_contacts(
         "$select": "id,displayName,emailAddresses,mobilePhone,companyName"
     }
     
-    response = requests.get(url, headers=get_headers(token), params=params)
-    
-    if response.status_code != 200:
-        raise Exception(f"Failed to search contacts: {response.status_code} - {response.text}")
+    response = api_request('get', url, token, params=params)
     
     data = response.json()
     return data.get("value", [])
@@ -380,10 +440,7 @@ def get_contact(contact_id: str, token: str = None) -> Dict[str, Any]:
     
     url = f"{GRAPH_API_BASE}/me/contacts/{contact_id}"
     
-    response = requests.get(url, headers=get_headers(token))
-    
-    if response.status_code != 200:
-        raise Exception(f"Failed to get contact: {response.status_code} - {response.text}")
+    response = api_request('get', url, token)
     
     return response.json()
 
@@ -399,10 +456,7 @@ def list_contact_folders(token: str = None) -> List[Dict[str, Any]]:
     
     url = f"{GRAPH_API_BASE}/me/contactFolders"
     
-    response = requests.get(url, headers=get_headers(token))
-    
-    if response.status_code != 200:
-        raise Exception(f"Failed to list contact folders: {response.status_code} - {response.text}")
+    response = api_request('get', url, token)
     
     data = response.json()
     return data.get("value", [])
@@ -441,10 +495,7 @@ def get_people(
     if query:
         params["$search"] = f'"{query}"'
     
-    response = requests.get(url, headers=get_headers(token), params=params)
-    
-    if response.status_code != 200:
-        raise Exception(f"Failed to get people: {response.status_code} - {response.text}")
+    response = api_request('get', url, token, params=params)
     
     data = response.json()
     return data.get("value", [])
