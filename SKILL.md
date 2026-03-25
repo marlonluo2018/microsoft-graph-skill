@@ -1,6 +1,14 @@
 ---
 name: microsoft-graph-skill
 description: Microsoft Graph API for email, calendar, and user operations. **ON STARTUP: Immediately check auth status (`python scripts/auth.py --status`). If not logged in, prompt user to login.** Triggers: "read my emails", "send an email", "check calendar", "create meeting", "find user".
+version: 1.0.0
+metadata:
+  openclaw:
+    requires:
+      bins:
+        - python
+    emoji: "\U0001F4E7"
+    homepage: https://github.com/openclaw/skills/tree/main/skills/microsoft-graph-skill
 ---
 
 # Microsoft Graph Skill
@@ -38,6 +46,9 @@ Microsoft Graph API for email, calendar, and user operations with OAuth2 device 
 | Reply | `reply <id> --body "..." [--all]` | Reply to email |
 | Forward | `forward <id> --to "..."` | Forward email |
 | Folders | `folders` | List all mail folders |
+| Attachments | `attachments <message_id>` | List attachments |
+| Download All | `attachments <message_id> --download` | Download all attachments |
+| Download One | `attachments <message_id> --id <att_id> -d` | Download specific attachment |
 
 **Folder Options:**
 - `--folder <name>` - Search in specific folder (default: inbox)
@@ -45,30 +56,23 @@ Microsoft Graph API for email, calendar, and user operations with OAuth2 device 
 - Available folder names: `inbox`, `sent`, `drafts`, `deleted`, `junk`, `outbox`
 - Or use folder ID directly (get IDs with `folders` command)
 
-**Search Parameters (common to list/search/find):**
-- `--from`, `--to`, `--subject`, `--body` - Search criteria
+**Key Options (common to list/search/find):**
+- `--from <email_or_name>` - Search by sender
+- `--to <email_or_name>` - Search by recipient
+- `--subject <text>` - Search in subject
+- `--body <text>` - Search in body
 - `--top N` - Max results (default 25)
-- `--preview` - Show email body preview
-- `--unread` - Show unread only
-- `--focused`, `--other` - Focused/Other inbox
-- `--filter` - OData filter query
+- `--folder <name>` - Specific folder (inbox/sent/drafts/deleted/all)
+- `--filter <odata>` - Advanced OData filter for date queries
 
-**Examples:**
-```bash
-# Search in specific folders
-py -3 email_operations.py list --folder sent --top 10
-py -3 email_operations.py find --folder drafts --subject "report"
-py -3 email_operations.py search --folder deleted --from "john"
+**Important - Search by Sender:**
+- ✅ `list --from "email@domain.com"`
+- ❌ `search --query "from:email"` (no --query parameter)
 
-# Search across ALL folders
-py -3 email_operations.py list --folder all --from "beng"
-
-# List all available folders
-py -3 email_operations.py folders
-
-# Outlook syntax auto-conversion
-py -3 email_operations.py find --from "from:beng"  # Auto-converts to --from "beng"
-```
+**Attachment Options:**
+- `--download`, `-d` - Download attachments
+- `--save-dir <path>` - Save directory (default: Desktop)
+- `--id <att_id>` - Download specific attachment
 
 **Auto-Features:** Outlook syntax detection, rate limit retry, CSV batching.
 

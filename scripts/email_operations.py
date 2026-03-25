@@ -1447,6 +1447,172 @@ def delete_email(message_id: str, token: str = None) -> bool:
 
 
 # =============================================================================
+# ATTACHMENT OPERATIONS
+# =============================================================================
+
+def list_attachments(message_id: str, token: str = None) -> List[Dict[str, Any]]:
+    """
+    List all attachments for a message.
+    
+    Args:
+        message_id: Message ID
+        token: Access token
+    
+    Returns:
+        List of attachment objects
+    """
+    if token is None:
+        token = get_access_token()
+    
+    url = f"{GRAPH_API_BASE}/me/messages/{message_id}/attachments"
+    
+    response = api_request('get', url, token)
+    
+    data = response.json()
+    attachments = data.get("value", [])
+    
+    return attachments
+
+
+def download_attachment(
+    message_id: str,
+    attachment_id: str,
+    save_dir: str = None,
+    token: str = None
+) -> Dict[str, Any]:
+    """
+    Download a specific attachment.
+    
+    Args:
+        message_id: Message ID
+        attachment_id: Attachment ID
+        save_dir: Directory to save the file (default: current directory)
+        token: Access token
+    
+    Returns:
+        Dictionary with download result
+    """
+    if token is None:
+        token = get_access_token()
+    
+    # Get attachment metadata
+    url = f"{GRAPH_API_BASE}/me/messages/{message_id}/attachments/{attachment_id}"
+    response = api_request('get', url, token)
+    
+    attachment = response.json()
+    
+    # Get file name and content
+    file_name = attachment.get('name', 'attachment')
+    content_bytes = attachment.get('contentBytes')
+    content_type = attachment.get('contentType', 'application/octet-stream')
+    
+    if not content_bytes:
+        # For file attachments, content is in contentBytes
+        # For item attachments (like emails), we need to handle differently
+        if attachment.get('@odata.type') == '#microsoft.graph.itemAttachment':
+            raise Exception("Item attachments (embedded emails) are not supported for direct download")
+        raise Exception("No content found in attachment")
+    
+    # Decode base64 content
+    import base64
+    file_content = base64.b64decode(content_bytes)
+    
+    # Determine save path
+    if save_dir:
+        save_path = Path(save_dir)
+        save_path.mkdir(parents=True, exist_ok=True)
+    else:
+        save_path = Path.cwd()
+    
+    file_path = save_path / file_name
+    
+    # Write file
+    with open(file_path, 'wb') as f:
+        f.write(file_content)
+    
+    return {
+        "success": True,
+        "file_name": file_name,
+        "file_path": str(file_path),
+        "size": len(file_content),
+        "content_type": content_type
+    }
+
+
+def download_all_attachments(
+    message_id: str,
+    save_dir: str = None,
+    token: str = None
+) -> List[Dict[str, Any]]:
+    """
+    Download all attachments from a message.
+    
+    Args:
+        message_id: Message ID
+        save_dir: Directory to save files (default: current directory)
+        token: Access token
+    
+    Returns:
+        List of download results
+    """
+    if token is None:
+        token = get_access_token()
+    
+    # Get all attachments
+    attachments = list_attachments(message_id, token)
+    
+    if not attachments:
+        return []
+    
+    results = []
+    for attachment in attachments:
+        attachment_id = attachment.get('id')
+        try:
+            result = download_attachment(message_id, attachment_id, save_dir, token)
+            results.append(result)
+        except Exception as e:
+            results.append({
+                "success": False,
+                "file_name": attachment.get('name', 'unknown'),
+                "error": str(e)
+            })
+    
+    return results
+
+
+def display_attachments(attachments: List[Dict]):
+    """Display a list of attachments."""
+    if not attachments:
+        print("No attachments found.")
+        return
+    
+    print(f"\n{'='*80}")
+    print(f"{'#':<5} {'Name':<40} {'Size':<15} {'Type':<20}")
+    print(f"{'='*80}")
+    
+    for i, att in enumerate(attachments, 1):
+        name = att.get('name', 'Unknown')[:40]
+        size = att.get('size', 0)
+        if size:
+            if size < 1024:
+                size_str = f"{size} B"
+            elif size < 1024 * 1024:
+                size_str = f"{size / 1024:.1f} KB"
+            else:
+                size_str = f"{size / (1024 * 1024):.1f} MB"
+        else:
+            size_str = "-"
+        
+        content_type = att.get('contentType', 'Unknown')[:20]
+        att_type = att.get('@odata.type', '').replace('#microsoft.graph.', '')
+        
+        print(f"{i:<5} {name:<40} {size_str:<15} {content_type:<20}")
+    
+    print(f"{'='*80}")
+    print(f"Total: {len(attachments)} attachments")
+
+
+# =============================================================================
 # LIST MAIL FOLDERS
 # =============================================================================
 
@@ -1747,6 +1913,13 @@ def main():
     folders_parser = subparsers.add_parser("folders", help="List all mail folders")
     folders_parser.add_argument("--all", dest="include_hidden", action="store_true", help="Include hidden folders")
     
+    # Attachments command
+    att_parser = subparsers.add_parser("attachments", help="List or download attachments")
+    att_parser.add_argument("message_id", help="Message ID")
+    att_parser.add_argument("--download", "-d", action="store_true", help="Download all attachments")
+    att_parser.add_argument("--save-dir", help="Directory to save attachments (default: current directory)")
+    att_parser.add_argument("--id", dest="attachment_id", help="Download specific attachment by ID")
+    
     args = parser.parse_args()
     
     # Auto-convert Outlook search syntax (e.g., "from:beng" -> --from "beng")
@@ -1924,6 +2097,41 @@ def main():
                 print(json.dumps({"success": True, "folders": folders, "total": len(folders)}, indent=2, default=str))
             else:
                 display_folder_list(folders)
+        
+        elif args.command == "attachments":
+            if args.download or args.attachment_id:
+                # Download mode
+                if args.attachment_id:
+                    # Download specific attachment
+                    result = download_attachment(args.message_id, args.attachment_id, args.save_dir)
+                    if args.json:
+                        print(json.dumps({"success": True, "result": result}, indent=2))
+                    else:
+                        print(f"✓ Downloaded: {result['file_name']}")
+                        print(f"  Path: {result['file_path']}")
+                        print(f"  Size: {result['size']} bytes")
+                else:
+                    # Download all attachments
+                    results = download_all_attachments(args.message_id, args.save_dir)
+                    if args.json:
+                        print(json.dumps({"success": True, "results": results}, indent=2))
+                    else:
+                        print(f"\n{'='*60}")
+                        print(f"ATTACHMENT DOWNLOAD RESULTS")
+                        print(f"{'='*60}")
+                        for r in results:
+                            if r.get('success'):
+                                print(f"✓ {r['file_name']} -> {r['file_path']}")
+                            else:
+                                print(f"✗ {r['file_name']}: {r.get('error', 'Unknown error')}")
+                        print(f"{'='*60}")
+            else:
+                # List mode
+                attachments = list_attachments(args.message_id)
+                if args.json:
+                    print(json.dumps({"success": True, "attachments": attachments, "total": len(attachments)}, indent=2, default=str))
+                else:
+                    display_attachments(attachments)
     
     except ValueError as e:
         if args.json:
