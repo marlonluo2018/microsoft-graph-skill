@@ -273,7 +273,8 @@ def list_messages(
     body: str = None,
     token: str = None,
     since: str = None,
-    before: str = None
+    before: str = None,
+    message_type: str = "all"
 ) -> List[Dict[str, Any]]:
     """
     List/search messages from a folder with optional search criteria.
@@ -292,6 +293,7 @@ def list_messages(
         token: Access token (will obtain if not provided)
         since: ISO 8601 timestamp to filter messages received AFTER this time (requires timezone)
         before: ISO 8601 timestamp to filter messages received BEFORE this time (requires timezone)
+        message_type: Filter by message type - "all" (default), "emails", or "events"
     
     Returns:
         List of message objects
@@ -353,6 +355,7 @@ def list_messages(
         url = f"{GRAPH_API_BASE}/me/mailFolders/{folder_id}/messages"
     
     # Build select fields
+    # Note: @odata.type is automatically included in responses, no need to select it
     select_fields = "id,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,hasAttachments,inferenceClassification"
     if include_preview:
         select_fields += ",bodyPreview"
@@ -361,6 +364,11 @@ def list_messages(
     params = {
         "$select": select_fields
     }
+    
+    # Add $expand for event messages to get response status and meeting time
+    # Only expand when we might show events (message_type is "all" or "events")
+    if message_type in ["all", "events"]:
+        params["$expand"] = "microsoft.graph.eventMessage/event($select=responseStatus,start,end,location)"
     
     # If search criteria provided, use $search
     # Track if since is handled in $search (KQL syntax) to avoid duplicate filtering
@@ -507,6 +515,16 @@ def list_messages(
     # Server-side filtering is now complete via KQL $search
     # No client-side filtering needed
     
+    # Filter by message type (client-side)
+    # Meeting invites are identified by @odata.type containing "eventMessage"
+    if message_type == "emails":
+        # Only show regular emails (exclude meeting invites)
+        messages = [m for m in messages if 'eventMessage' not in m.get('@odata.type', '')]
+    elif message_type == "events":
+        # Only show meeting invites
+        messages = [m for m in messages if 'eventMessage' in m.get('@odata.type', '')]
+    # "all" = no filtering, show everything
+    
     # Build time info for display
     time_info = None
     if since_info or before_info:
@@ -543,6 +561,121 @@ def get_message(message_id: str, token: str = None) -> Dict[str, Any]:
     response = api_request('get', url, token)
     
     return response.json()
+
+def get_event_from_message(message_id: str, token: str = None) -> Dict[str, Any]:
+    """
+    Get the event associated with a meeting invite message.
+    
+    Args:
+        message_id: Message ID of the meeting invite
+        token: Access token
+    
+    Returns:
+        Event object with event ID
+    
+    Raises:
+        Exception: If message is not a meeting invite or event not found
+    """
+    if token is None:
+        token = get_access_token()
+    
+    # Get the message with expanded event data
+    url = f"{GRAPH_API_BASE}/me/messages/{message_id}"
+    params = {"$expand": "microsoft.graph.eventMessage/event"}
+    
+    response = api_request('get', url, token, params=params)
+    message = response.json()
+    
+    # Check if this is a meeting invite
+    if 'eventMessage' not in message.get('@odata.type', ''):
+        raise ValueError("This message is not a meeting invite")
+    
+    # Extract the event from the expanded data
+    if 'event' not in message:
+        raise ValueError("Could not retrieve event data from meeting invite")
+    
+    return message['event']
+
+
+def accept_meeting_invite(
+    message_id: str,
+    comment: str = None,
+    send_response: bool = True,
+    token: str = None
+) -> bool:
+    """
+    Accept a meeting invite from a message.
+    
+    Args:
+        message_id: Message ID of the meeting invite
+        comment: Optional comment to include in response
+        send_response: Whether to send response to organizer
+        token: Access token
+    
+    Returns:
+        bool: True if successful
+    """
+    if token is None:
+        token = get_access_token()
+    
+    # Get the event ID from the message
+    event = get_event_from_message(message_id, token)
+    event_id = event['id']
+    
+    # Accept the event using calendar API
+    url = f"{GRAPH_API_BASE}/me/events/{event_id}/accept"
+    
+    payload = {
+        "sendResponse": send_response
+    }
+    
+    if comment:
+        payload["comment"] = comment
+    
+    response = api_request('post', url, token, json=payload)
+    
+    return response.status_code == 202
+
+
+def decline_meeting_invite(
+    message_id: str,
+    comment: str = None,
+    send_response: bool = True,
+    token: str = None
+) -> bool:
+    """
+    Decline a meeting invite from a message.
+    
+    Args:
+        message_id: Message ID of the meeting invite
+        comment: Optional comment to include in response
+        send_response: Whether to send response to organizer
+        token: Access token
+    
+    Returns:
+        bool: True if successful
+    """
+    if token is None:
+        token = get_access_token()
+    
+    # Get the event ID from the message
+    event = get_event_from_message(message_id, token)
+    event_id = event['id']
+    
+    # Decline the event using calendar API
+    url = f"{GRAPH_API_BASE}/me/events/{event_id}/decline"
+    
+    payload = {
+        "sendResponse": send_response
+    }
+    
+    if comment:
+        payload["comment"] = comment
+    
+    response = api_request('post', url, token, json=payload)
+    
+    return response.status_code == 202
+
 
 
 # =============================================================================
@@ -970,6 +1103,7 @@ def batch_reply_email(
     email_column: str = None,
     body_type: str = "html",
     include_history: bool = True,
+    attachments: List[Dict] = None,
     importance: str = None,
     token: str = None
 ) -> Dict[str, Any]:
@@ -991,6 +1125,7 @@ def batch_reply_email(
         email_column: Column name in CSV for email addresses (auto-detect if not specified)
         body_type: "html" or "text"
         include_history: If True, include original message in reply body
+        attachments: List of attachment objects (prepared by prepare_file_attachments)
         importance: "low", "normal", or "high"
         token: Access token
     
@@ -1030,7 +1165,7 @@ def batch_reply_email(
     
     # If within limit, use regular send_email
     if total_recipients <= MAX_RECIPIENTS:
-        send_email(to, subject, full_body, cc, bcc, body_type, None, True, importance, token)
+        send_email(to, subject, full_body, cc, bcc, body_type, attachments, True, importance, token)
         return {
             "success": True,
             "message": "Reply sent successfully",
@@ -1707,6 +1842,249 @@ def display_attachments(attachments: List[Dict]):
     print(f"{'='*80}")
     print(f"Total: {len(attachments)} attachments")
 
+def prepare_file_attachments(file_paths: List[str]) -> tuple[List[Dict[str, Any]], List[str]]:
+    """
+    Prepare file attachments for sending via Microsoft Graph API.
+    
+    Supports files up to 150 MB (Microsoft Graph limit).
+    Files under 3 MB use inline attachment.
+    Files 3-150 MB require draft message + upload session.
+    
+    Args:
+        file_paths: List of file paths to attach
+    
+    Returns:
+        Tuple of (inline_attachments, large_file_paths)
+        - inline_attachments: List of attachment objects for files < 3 MB
+        - large_file_paths: List of file paths for files >= 3 MB (need upload session)
+    
+    Raises:
+        FileNotFoundError: If any file doesn't exist
+        Exception: If file is too large or can't be read
+    """
+    import base64
+    import mimetypes
+    
+    inline_attachments = []
+    large_file_paths = []
+    max_inline_size = 3 * 1024 * 1024  # 3 MB limit for inline attachments
+    max_total_size = 150 * 1024 * 1024  # 150 MB total limit per message
+    
+    for file_path in file_paths:
+        path = Path(file_path)
+        
+        if not path.exists():
+            raise FileNotFoundError(f"Attachment file not found: {file_path}")
+        
+        file_size = path.stat().st_size
+        
+        # Check absolute maximum
+        if file_size > max_total_size:
+            raise Exception(
+                f"File '{path.name}' is too large ({file_size / (1024*1024):.1f} MB). "
+                f"Maximum size per file is 150 MB."
+            )
+        
+        # For files > 3 MB, we need to use upload session (create draft + upload)
+        if file_size > max_inline_size:
+            large_file_paths.append(file_path)
+            print(f"📎 Large file detected: {path.name} ({file_size / (1024*1024):.1f} MB) - will use upload session")
+            continue
+        
+        # Read file content for inline attachment
+        try:
+            with open(path, 'rb') as f:
+                file_content = f.read()
+        except Exception as e:
+            raise Exception(f"Failed to read file '{file_path}': {str(e)}")
+        
+        # Encode to base64
+        content_bytes = base64.b64encode(file_content).decode('utf-8')
+        
+        # Detect MIME type
+        mime_type, _ = mimetypes.guess_type(str(path))
+        if not mime_type:
+            mime_type = 'application/octet-stream'
+        
+        # Create attachment object
+        attachment = {
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": path.name,
+            "contentType": mime_type,
+            "contentBytes": content_bytes
+        }
+        
+        inline_attachments.append(attachment)
+        print(f"📎 Inline attachment prepared: {path.name} ({file_size / 1024:.1f} KB)")
+    
+    return inline_attachments, large_file_paths
+
+
+def create_draft_message(
+    to: List[str],
+    subject: str,
+    body: str,
+    cc: List[str] = None,
+    bcc: List[str] = None,
+    body_type: str = "html",
+    importance: str = None,
+    token: str = None
+) -> str:
+    """
+    Create a draft message and return its ID.
+    
+    Args:
+        to: List of To recipient emails
+        subject: Email subject
+        body: Email body content
+        cc: List of CC recipient emails
+        bcc: List of BCC recipient emails
+        body_type: "html" or "text"
+        importance: "low", "normal", or "high"
+        token: Access token
+    
+    Returns:
+        str: Draft message ID
+    """
+    if token is None:
+        token = get_access_token()
+    
+    # Convert plain text body to HTML if needed
+    if body_type == "html" and not body.strip().startswith('<'):
+        body = body.replace('\n', '<br>')
+    
+    # Build message payload
+    message = {
+        "subject": subject,
+        "body": {
+            "contentType": body_type,
+            "content": body
+        },
+        "toRecipients": [format_email_address(e) for e in (to or [])],
+        "ccRecipients": [format_email_address(e) for e in (cc or [])],
+        "bccRecipients": [format_email_address(e) for e in (bcc or [])]
+    }
+    
+    # Add importance if specified
+    if importance and importance.lower() in ['low', 'normal', 'high']:
+        message["importance"] = importance.lower()
+    
+    url = f"{GRAPH_API_BASE}/me/messages"
+    
+    response = api_request('post', url, token, json=message)
+    draft = response.json()
+    
+    return draft['id']
+
+
+def upload_large_attachment(
+    message_id: str,
+    file_path: str,
+    token: str = None
+) -> bool:
+    """
+    Upload a large attachment (>3MB) to a draft message using upload session.
+    
+    Args:
+        message_id: Draft message ID
+        file_path: Path to file to attach
+        token: Access token
+    
+    Returns:
+        bool: True if successful
+    """
+    import mimetypes
+    
+    if token is None:
+        token = get_access_token()
+    
+    path = Path(file_path)
+    
+    if not path.exists():
+        raise FileNotFoundError(f"Attachment file not found: {file_path}")
+    
+    file_size = path.stat().st_size
+    file_name = path.name
+    
+    # Detect MIME type
+    mime_type, _ = mimetypes.guess_type(str(path))
+    if not mime_type:
+        mime_type = 'application/octet-stream'
+    
+    # Create upload session
+    url = f"{GRAPH_API_BASE}/me/messages/{message_id}/attachments/createUploadSession"
+    
+    attachment_item = {
+        "attachmentType": "file",
+        "name": file_name,
+        "size": file_size
+    }
+    
+    payload = {
+        "AttachmentItem": attachment_item
+    }
+    
+    response = api_request('post', url, token, json=payload)
+    upload_session = response.json()
+    upload_url = upload_session['uploadUrl']
+    
+    # Upload file in chunks (recommended chunk size: 5-10 MB)
+    chunk_size = 5 * 1024 * 1024  # 5 MB chunks
+    
+    with open(path, 'rb') as f:
+        file_data = f.read()
+    
+    bytes_uploaded = 0
+    total_bytes = len(file_data)
+    
+    print(f"📤 Uploading {file_name} ({total_bytes / (1024*1024):.1f} MB)...")
+    
+    while bytes_uploaded < total_bytes:
+        chunk_end = min(bytes_uploaded + chunk_size, total_bytes)
+        chunk = file_data[bytes_uploaded:chunk_end]
+        
+        # Prepare headers for this chunk
+        headers = {
+            'Content-Length': str(len(chunk)),
+            'Content-Range': f'bytes {bytes_uploaded}-{chunk_end-1}/{total_bytes}',
+            'Content-Type': 'application/octet-stream'
+        }
+        
+        # Upload chunk (don't use api_request as it adds auth headers we don't need for upload URL)
+        response = requests.put(upload_url, headers=headers, data=chunk)
+        
+        if response.status_code not in [200, 201, 202]:
+            raise Exception(f"Upload failed: {response.status_code} - {response.text}")
+        
+        bytes_uploaded = chunk_end
+        progress = (bytes_uploaded / total_bytes) * 100
+        print(f"  Progress: {progress:.1f}% ({bytes_uploaded / (1024*1024):.1f} MB / {total_bytes / (1024*1024):.1f} MB)")
+    
+    print(f"✓ Upload complete: {file_name}")
+    return True
+
+
+def send_draft_message(message_id: str, token: str = None) -> bool:
+    """
+    Send a draft message.
+    
+    Args:
+        message_id: Draft message ID
+        token: Access token
+    
+    Returns:
+        bool: True if successful
+    """
+    if token is None:
+        token = get_access_token()
+    
+    url = f"{GRAPH_API_BASE}/me/messages/{message_id}/send"
+    
+    response = api_request('post', url, token)
+    
+    return True
+
+
 
 # =============================================================================
 # LIST MAIL FOLDERS
@@ -1772,7 +2150,7 @@ def display_folder_list(folders: List[Dict]):
 # DISPLAY HELPERS
 # =============================================================================
 
-def display_message_list(messages: List[Dict], show_preview: bool = True, show_detail: bool = False, display_timezone: str = None):
+def display_message_list(messages: List[Dict], show_preview: bool = True, show_detail: bool = False, display_timezone: str = None, message_type: str = "all"):
     """Display a list of messages in a readable format.
     
     Args:
@@ -1780,25 +2158,54 @@ def display_message_list(messages: List[Dict], show_preview: bool = True, show_d
         show_preview: Show bodyPreview (first few lines)
         show_detail: Show full body content (requires --detail flag to fetch full messages)
         display_timezone: Timezone for display (e.g., "+08:00" or "UTC")
+        message_type: Message type filter - "all" (show categorized), "emails", or "events"
     """
-    # Determine display timezone (default: show original UTC)
+    # If message_type is "all", categorize messages into emails and events
+    # Meeting invites are identified by @odata.type containing "eventMessage"
+    if message_type == "all":
+        emails = [m for m in messages if 'eventMessage' not in m.get('@odata.type', '')]
+        events = [m for m in messages if 'eventMessage' in m.get('@odata.type', '')]
+        
+        # Display emails first
+        if emails:
+            print(f"\n{'='*80}")
+            print(f"📧 EMAILS ({len(emails)} messages)")
+            print(f"{'='*80}")
+            display_message_list(emails, show_preview, show_detail, display_timezone, "emails")
+        
+        # Display events second
+        if events:
+            print(f"\n{'='*80}")
+            print(f"📅 MEETING INVITES ({len(events)} messages)")
+            print(f"{'='*80}")
+            display_message_list(events, show_preview, show_detail, display_timezone, "events")
+        
+        # Display total
+        print(f"\n{'='*80}")
+        print(f"Total: {len(messages)} messages ({len(emails)} emails, {len(events)} events)")
+        return
+    
+    # Determine display timezone
     display_tz = None
-    if display_timezone and display_timezone != "UTC":
+    if display_timezone:
         try:
-            # Parse timezone offset like "+08:00" or "-05:00"
-            import re
-            match = re.match(r'^([+-])(\d{2}):?(\d{2})?$', display_timezone)
-            if match:
-                sign = match.group(1)
-                hours = int(match.group(2))
-                # mins = int(match.group(3)) if match.group(3) else 0  # Not used for ZoneInfo
-                # ZoneInfo uses Etc/GMT convention (inverted sign)
-                if sign == '+':
-                    display_tz = ZoneInfo(f"Etc/GMT-{hours}")
-                else:
-                    display_tz = ZoneInfo(f"Etc/GMT+{hours}")
+            # Try to use timezone name directly (e.g., "Asia/Shanghai")
+            display_tz = ZoneInfo(display_timezone)
         except Exception:
-            pass  # Fallback to UTC display
+            try:
+                # Parse timezone offset like "+08:00" or "-05:00"
+                import re
+                match = re.match(r'^([+-])(\d{2}):?(\d{2})?$', display_timezone)
+                if match:
+                    sign = match.group(1)
+                    hours = int(match.group(2))
+                    # ZoneInfo uses Etc/GMT convention (inverted sign)
+                    if sign == '+':
+                        display_tz = ZoneInfo(f"Etc/GMT-{hours}")
+                    else:
+                        display_tz = ZoneInfo(f"Etc/GMT+{hours}")
+            except Exception:
+                pass  # Fallback to UTC display
     
     # If show_detail is True, show full body content
     if show_detail:
@@ -1923,6 +2330,126 @@ def display_message_list(messages: List[Dict], show_preview: bool = True, show_d
             print(f"   Date: {received}")
             print(f"   ID: {message_id}")
             
+            # Show response status and meeting time for meeting invites
+            if 'eventMessage' in msg.get('@odata.type', ''):
+                # Try to get event data - it might be in the message or need to be fetched
+                event = msg.get('event')
+                if not event:
+                    # Event data not expanded, try to fetch it
+                    try:
+                        event = get_event_from_message(message_id, token=None)
+                    except:
+                        event = None
+                
+                if event:
+                    response_status = event.get('responseStatus', {})
+                    response = response_status.get('response', 'none')
+                    # Map response to emoji and text
+                    status_map = {
+                        'accepted': '✅ Accepted',
+                        'declined': '❌ Declined',
+                        'tentativelyAccepted': '❓ Tentative',
+                        'notResponded': '⏳ Not Responded',
+                        'organizer': '👤 Organizer',
+                        'none': '⏳ Not Responded'
+                    }
+                    status_display = status_map.get(response, f'❔ {response}')
+                    print(f"   Status: {status_display}")
+                    
+                    # Only show meeting time and availability for meetings not yet responded to
+                    # For accepted/declined/tentative meetings, just show the status
+                    if response in ['notResponded', 'none']:
+                        # Show meeting time and availability
+                        start_info = event.get('start', {})
+                        end_info = event.get('end', {})
+                    else:
+                        start_info = None
+                        end_info = None
+                    
+                    if start_info and end_info:
+                        start_dt_str = start_info.get('dateTime', '')
+                        end_dt_str = end_info.get('dateTime', '')
+                        start_tz = start_info.get('timeZone', 'UTC')
+                        
+                        if start_dt_str and end_dt_str:
+                            try:
+                                # Parse datetime (handle Microsoft's format with extra precision)
+                                start_str = start_dt_str.split('.')[0]
+                                end_str = end_dt_str.split('.')[0]
+                                
+                                start_dt = datetime.fromisoformat(start_str).replace(tzinfo=ZoneInfo('UTC'))
+                                end_dt = datetime.fromisoformat(end_str).replace(tzinfo=ZoneInfo('UTC'))
+                                
+                                # Convert to user's timezone if display_tz is set, otherwise use UTC+8
+                                user_tz = display_tz if display_tz else ZoneInfo('Asia/Shanghai')
+                                start_local = start_dt.astimezone(user_tz)
+                                end_local = end_dt.astimezone(user_tz)
+                                
+                                duration_mins = (end_dt - start_dt).total_seconds() / 60
+                                
+                                # Check availability
+                                # For accepted meetings: show actual busy status (don't exclude itself)
+                                # For not responded meetings: exclude itself to check for conflicts
+                                availability_status = "❓ Unknown"
+                                recommendation = ""
+                                
+                                # Only check availability for meetings not yet responded to
+                                if response in ['notResponded', 'none']:
+                                    try:
+                                        # Import calendar operations to check availability
+                                        import sys
+                                        from pathlib import Path
+                                        sys.path.insert(0, str(Path(__file__).parent))
+                                        from calendar_operations import get_availability
+                                        
+                                        # Get current user's email
+                                        my_email = get_my_email()
+                                        
+                                        # Check if user is free during this time
+                                        # Convert datetime to ISO format for API
+                                        avail_result = get_availability(
+                                            emails=[my_email],
+                                            start=start_dt.isoformat(),
+                                            end=end_dt.isoformat(),
+                                            timezone='UTC'
+                                        )
+                                        
+                                        # Parse availability - check schedule items to see if there are OTHER meetings
+                                        schedules = avail_result.get('value', [])
+                                        if schedules:
+                                            schedule = schedules[0]
+                                            schedule_items = schedule.get('scheduleItems', [])
+                                            
+                                            # Get this event's subject - try event first, then fall back to message subject
+                                            current_subject = event.get('subject', '') or msg.get('subject', '')
+                                            current_subject = current_subject.strip()
+                                            
+                                            # Check if there are any OTHER events (excluding this one by subject)
+                                            other_events = []
+                                            for item in schedule_items:
+                                                item_subject = item.get('subject', '').strip()
+                                                
+                                                # Skip if this is the same event (match by subject)
+                                                # Use case-insensitive comparison
+                                                if item_subject.lower() == current_subject.lower():
+                                                    continue
+                                                
+                                                other_events.append(item)
+                                            
+                                            if not other_events:
+                                                availability_status = "✅ Free"
+                                                recommendation = " → Recommend Accept"
+                                            else:
+                                                availability_status = f"❌ Busy ({len(other_events)} conflict{'s' if len(other_events) > 1 else ''})"
+                                                recommendation = " → Not Recommended"
+                                    except Exception as e:
+                                        # If availability check fails, just show unknown
+                                        pass
+                                
+                                print(f"   Time: {start_local.strftime('%Y-%m-%d %H:%M')} - {end_local.strftime('%H:%M')} ({duration_mins:.0f} min) {availability_status}{recommendation}")
+                            except Exception:
+                                pass  # If parsing fails, just don't show time
+            
             # Show To recipients
             to_recipients = msg.get('toRecipients', [])
             if to_recipients:
@@ -2031,6 +2558,9 @@ def main():
     list_parser.add_argument("--detail", action="store_true", help="Show full email body content (alias for --preview with more detail)")
     list_parser.add_argument("--focused", action="store_true", help="Show Focused inbox only")
     list_parser.add_argument("--other", action="store_true", help="Show Other inbox only")
+    # Message type filters
+    list_parser.add_argument("--emails-only", action="store_true", help="Show only emails (exclude meeting invites)")
+    list_parser.add_argument("--events-only", action="store_true", help="Show only meeting invites (exclude regular emails)")
     # Search parameters
     list_parser.add_argument("--from", dest="from_sender", help="Search by sender name or email")
     list_parser.add_argument("--to", dest="to_recipient", help="Search by recipient name or email")
@@ -2038,6 +2568,7 @@ def main():
     list_parser.add_argument("--body", help="Search by body text")
     list_parser.add_argument("--since", help="Filter messages received after this timestamp (required format with timezone: '2026-03-26T04:00:00Z' or '2026-03-26T12:00:00+08:00')")
     list_parser.add_argument("--before", help="Filter messages received before this timestamp (required format with timezone: '2026-03-26T04:00:00Z' or '2026-03-26T12:00:00+08:00')")
+    list_parser.add_argument("--timezone", required=True, help="Display timezone (required, e.g., 'Asia/Shanghai', '+08:00', 'UTC')")
     
     # Search command (complete alias for list, supports all parameters)
     search_parser = subparsers.add_parser("search", help="Search/list messages (alias for list)")
@@ -2049,6 +2580,9 @@ def main():
     search_parser.add_argument("--detail", action="store_true", help="Show full email body content (alias for --preview with more detail)")
     search_parser.add_argument("--focused", action="store_true", help="Show Focused inbox only")
     search_parser.add_argument("--other", action="store_true", help="Show Other inbox only")
+    # Message type filters
+    search_parser.add_argument("--emails-only", action="store_true", help="Show only emails (exclude meeting invites)")
+    search_parser.add_argument("--events-only", action="store_true", help="Show only meeting invites (exclude regular emails)")
     # Search parameters
     search_parser.add_argument("--from", dest="from_sender", help="Search by sender name or email")
     search_parser.add_argument("--to", dest="to_recipient", help="Search by recipient name or email")
@@ -2056,6 +2590,7 @@ def main():
     search_parser.add_argument("--body", help="Search by body text")
     search_parser.add_argument("--since", help="Filter messages received after this timestamp (required format with timezone: '2026-03-26T04:00:00Z' or '2026-03-26T12:00:00+08:00')")
     search_parser.add_argument("--before", help="Filter messages received before this timestamp (required format with timezone: '2026-03-26T04:00:00Z' or '2026-03-26T12:00:00+08:00')")
+    search_parser.add_argument("--timezone", required=True, help="Display timezone (required, e.g., 'Asia/Shanghai', '+08:00', 'UTC')")
     
     # Find command (complete alias for list, supports all parameters)
     find_parser = subparsers.add_parser("find", help="Find/list messages (alias for list)")
@@ -2067,6 +2602,9 @@ def main():
     find_parser.add_argument("--detail", action="store_true", help="Show full email body content (alias for --preview with more detail)")
     find_parser.add_argument("--focused", action="store_true", help="Show Focused inbox only")
     find_parser.add_argument("--other", action="store_true", help="Show Other inbox only")
+    # Message type filters
+    find_parser.add_argument("--emails-only", action="store_true", help="Show only emails (exclude meeting invites)")
+    find_parser.add_argument("--events-only", action="store_true", help="Show only meeting invites (exclude regular emails)")
     # Search parameters
     find_parser.add_argument("--from", dest="from_sender", help="Search by sender name or email")
     find_parser.add_argument("--to", dest="to_recipient", help="Search by recipient name or email")
@@ -2074,6 +2612,7 @@ def main():
     find_parser.add_argument("--body", help="Search by body text")
     find_parser.add_argument("--since", help="Filter messages received after this timestamp (required format with timezone: '2026-03-26T04:00:00Z' or '2026-03-26T12:00:00+08:00')")
     find_parser.add_argument("--before", help="Filter messages received before this timestamp (required format with timezone: '2026-03-26T04:00:00Z' or '2026-03-26T12:00:00+08:00')")
+    find_parser.add_argument("--timezone", required=True, help="Display timezone (required, e.g., 'Asia/Shanghai', '+08:00', 'UTC')")
     
     # Get command
     get_parser = subparsers.add_parser("get", help="Get a message")
@@ -2092,6 +2631,7 @@ def main():
     send_parser.add_argument("--email-column", help="Column name in CSV for emails (auto-detected if not specified)")
     send_parser.add_argument("--subject", required=True, help="Email subject")
     send_parser.add_argument("--body", required=True, help="Email body")
+    send_parser.add_argument("--attachments", action="append", help="File paths to attach (can use multiple --attachments)")
     send_parser.add_argument("--body-type", choices=["html", "text"], default="html")
     
     # Reply command (supports batching automatically)
@@ -2107,6 +2647,7 @@ def main():
     reply_parser.add_argument("--bcc", help="BCC recipients (comma-separated)")
     reply_parser.add_argument("--csv", dest="csv_path", help="CSV file containing BCC email addresses")
     reply_parser.add_argument("--email-column", help="Column name in CSV for emails (auto-detected if not specified)")
+    reply_parser.add_argument("--attachments", action="append", help="File paths to attach (can use multiple --attachments)")
     reply_parser.add_argument("--importance", choices=["low", "normal", "high"], help="Email importance level")
     
     # Forward command (supports batching automatically)
@@ -2139,6 +2680,18 @@ def main():
     att_parser.add_argument("--save-dir", help="Directory to save attachments (default: current directory)")
     att_parser.add_argument("--id", dest="attachment_id", help="Download specific attachment by ID")
     
+    # Accept meeting invite command
+    accept_parser = subparsers.add_parser("accept-invite", help="Accept a meeting invite")
+    accept_parser.add_argument("message_id", help="Message ID of the meeting invite")
+    accept_parser.add_argument("--comment", help="Optional comment to include in response")
+    accept_parser.add_argument("--no-send", action="store_true", help="Don't send response to organizer")
+    
+    # Decline meeting invite command
+    decline_parser = subparsers.add_parser("decline-invite", help="Decline a meeting invite")
+    decline_parser.add_argument("message_id", help="Message ID of the meeting invite")
+    decline_parser.add_argument("--comment", help="Optional comment to include in response")
+    decline_parser.add_argument("--no-send", action="store_true", help="Don't send response to organizer")
+    
     args = parser.parse_args()
     
     # Pre-process body/comment arguments: convert escape sequences like \n to actual newlines
@@ -2170,6 +2723,13 @@ def main():
             # Check if --detail flag is set
             show_detail = getattr(args, 'detail', False)
             
+            # Determine message_type based on flags
+            message_type = "all"  # default: show all with categorization
+            if getattr(args, 'emails_only', False):
+                message_type = "emails"
+            elif getattr(args, 'events_only', False):
+                message_type = "events"
+            
             messages, time_info = list_messages(
                 folder=args.folder,
                 limit=args.limit,
@@ -2181,7 +2741,8 @@ def main():
                 subject=getattr(args, 'subject', None),
                 body=getattr(args, 'body', None),
                 since=getattr(args, 'since', None),
-                before=getattr(args, 'before', None)
+                before=getattr(args, 'before', None),
+                message_type=message_type
             )
             
             # If --detail flag is set, fetch full message content for each result
@@ -2207,22 +2768,24 @@ def main():
                         }
                 print(json.dumps(result, indent=2, default=str))
             else:
+                # Use user-specified timezone for display
+                display_tz = getattr(args, 'timezone', None)
+                
+                # Display timezone first
+                if display_tz:
+                    print(f"   Display Timezone: {display_tz}")
+                
                 # Display time info
-                display_tz = None
                 if time_info:
                     # Use since timezone for display if available, otherwise before
                     if time_info.get('since'):
-                        display_tz = time_info['since'].get('timezone_offset')
                         print(f"\n📅 Since: {time_info['since']['original']}")
                         print(f"   UTC: {time_info['since']['converted_utc']}")
                     if time_info.get('before'):
-                        if not display_tz:
-                            display_tz = time_info['before'].get('timezone_offset')
                         print(f"\n📅 Before: {time_info['before']['original']}")
                         print(f"   UTC: {time_info['before']['converted_utc']}")
-                    if display_tz and display_tz != "UTC":
-                        print(f"   Display Timezone: {display_tz}")
-                display_message_list(messages, show_preview=True, show_detail=show_detail, display_timezone=display_tz)
+                    
+                display_message_list(messages, show_preview=True, show_detail=show_detail, display_timezone=display_tz, message_type=message_type)
         
         elif args.command == "get":
             message = get_message(args.message_id)
@@ -2255,41 +2818,163 @@ def main():
                 for bcc_arg in args.bcc:
                     bcc_list.extend(parse_email_list(bcc_arg))
             
-            result = batch_send_email(
-                to=to_list if to_list else None,
-                subject=args.subject,
-                body=args.body,
-                cc=cc_list if cc_list else None,
-                bcc=bcc_list if bcc_list else None,
-                csv_path=getattr(args, 'csv_path', None),
-                email_column=getattr(args, 'email_column', None),
-                body_type=args.body_type
-            )
-            if args.json:
-                print(json.dumps(result, indent=2))
-            elif result['total_batches'] > 1:
-                print(f"\n{'='*60}")
-                print(f"SEND RESULTS (Batched)")
-                print(f"{'='*60}")
-                print(f"Total recipients: {result['total_recipients']}")
-                print(f"Total batches: {result['total_batches']}")
-                print(f"Sent: {result['sent_count']}")
-                print(f"Failed: {result['failed_count']}")
-                if result.get('errors'):
-                    print(f"\nErrors:")
-                    for error in result['errors']:
-                        print(f"  - {error}")
-                print(f"{'='*60}")
-            else:
+            # Handle attachments
+            inline_attachments = None
+            large_files = []
+            if hasattr(args, 'attachments') and args.attachments:
+                try:
+                    inline_attachments, large_files = prepare_file_attachments(args.attachments)
+                    if inline_attachments:
+                        print(f"✓ Prepared {len(inline_attachments)} inline attachment(s)")
+                    if large_files:
+                        print(f"✓ Detected {len(large_files)} large file(s) for upload session")
+                except Exception as e:
+                    print(f"✗ Error preparing attachments: {str(e)}")
+                    sys.exit(1)
+            
+            # If we have large files, use draft + upload session workflow
+            if large_files:
+                print("📧 Creating draft message for large attachments...")
+                draft_id = create_draft_message(
+                    to=to_list if to_list else [],
+                    subject=args.subject,
+                    body=args.body,
+                    cc=cc_list if cc_list else None,
+                    bcc=bcc_list if bcc_list else None,
+                    body_type=args.body_type,
+                    importance=getattr(args, 'importance', None)
+                )
+                print(f"✓ Draft created: {draft_id}")
+                
+                # Add inline attachments to draft if any
+                if inline_attachments:
+                    print(f"📎 Adding {len(inline_attachments)} inline attachment(s) to draft...")
+                    url = f"{GRAPH_API_BASE}/me/messages/{draft_id}"
+                    token = get_access_token()
+                    # Update draft with inline attachments
+                    for attachment in inline_attachments:
+                        attach_url = f"{url}/attachments"
+                        api_request('post', attach_url, token, json=attachment)
+                    print(f"✓ Inline attachments added")
+                
+                # Upload large files
+                for file_path in large_files:
+                    upload_large_attachment(draft_id, file_path)
+                
+                # Send the draft
+                print("📤 Sending message...")
+                send_draft_message(draft_id)
                 print("✓ Email sent successfully")
+            else:
+                # Normal send with inline attachments only
+                result = batch_send_email(
+                    to=to_list if to_list else None,
+                    subject=args.subject,
+                    body=args.body,
+                    cc=cc_list if cc_list else None,
+                    bcc=bcc_list if bcc_list else None,
+                    csv_path=getattr(args, 'csv_path', None),
+                    email_column=getattr(args, 'email_column', None),
+                    body_type=args.body_type,
+                    attachments=inline_attachments
+                )
+                if args.json:
+                    print(json.dumps(result, indent=2))
+                elif result['total_batches'] > 1:
+                    print(f"\n{'='*60}")
+                    print(f"SEND RESULTS (Batched)")
+                    print(f"{'='*60}")
+                    print(f"Total recipients: {result['total_recipients']}")
+                    print(f"Total batches: {result['total_batches']}")
+                    print(f"Sent: {result['sent_count']}")
+                    print(f"Failed: {result['failed_count']}")
+                    if result.get('errors'):
+                        print(f"\nErrors:")
+                        for error in result['errors']:
+                            print(f"  - {error}")
+                    print(f"{'='*60}")
+                else:
+                    print("✓ Email sent successfully")
         
         elif args.command == "reply":
-            # Determine which function to use:
-            # - Standard reply_email: when replying to original sender only (no extra recipients)
-            # - batch_reply_email: when adding custom recipients via --to/--cc/--bcc/--csv
-            has_extra_recipients = args.to or args.cc or args.bcc or getattr(args, 'csv_path', None)
+            # Handle attachments
+            inline_attachments = None
+            large_files = []
+            if hasattr(args, 'attachments') and args.attachments:
+                try:
+                    inline_attachments, large_files = prepare_file_attachments(args.attachments)
+                    if inline_attachments:
+                        print(f"✓ Prepared {len(inline_attachments)} inline attachment(s)")
+                    if large_files:
+                        print(f"✓ Detected {len(large_files)} large file(s) for upload session")
+                except Exception as e:
+                    print(f"✗ Error preparing attachments: {str(e)}")
+                    sys.exit(1)
             
-            if not has_extra_recipients:
+            # Determine which function to use:
+            # - Standard reply_email: when replying to original sender only (no extra recipients/attachments)
+            # - batch_reply_email: when adding custom recipients via --to/--cc/--bcc/--csv or attachments
+            # - Draft workflow: when large files are present
+            has_extra_recipients = args.to or args.cc or args.bcc or getattr(args, 'csv_path', None)
+            has_attachments = inline_attachments is not None or large_files
+            
+            # Large files require draft workflow
+            if large_files:
+                print("📧 Creating reply draft for large attachments...")
+                token = get_access_token()
+                
+                # Create reply draft
+                url = f"{GRAPH_API_BASE}/me/messages/{args.message_id}/createReply"
+                response = api_request('post', url, token)
+                draft = response.json()
+                draft_id = draft['id']
+                print(f"✓ Reply draft created: {draft_id}")
+                
+                # Get the draft to see existing body (which includes thread)
+                update_url = f"{GRAPH_API_BASE}/me/messages/{draft_id}"
+                draft_response = api_request('get', update_url, token)
+                draft_data = draft_response.json()
+                existing_body = draft_data.get('body', {}).get('content', '')
+                
+                # Prepend our new content to existing body (which has the thread)
+                new_content = args.body
+                if not new_content.strip().startswith('<'):
+                    new_content = new_content.replace('\n', '<br>')
+                
+                # Combine: new content + existing thread
+                combined_body = f"{new_content}<br><br>{existing_body}"
+                
+                update_payload = {
+                    "body": {
+                        "contentType": "html",
+                        "content": combined_body
+                    }
+                }
+                api_request('patch', update_url, token, json=update_payload)
+                print("✓ Reply body updated with thread preserved")
+                
+                # Add inline attachments if any
+                if inline_attachments:
+                    print(f"📎 Adding {len(inline_attachments)} inline attachment(s)...")
+                    for attachment in inline_attachments:
+                        attach_url = f"{update_url}/attachments"
+                        api_request('post', attach_url, token, json=attachment)
+                    print(f"✓ Inline attachments added")
+                
+                # Upload large files
+                for file_path in large_files:
+                    upload_large_attachment(draft_id, file_path)
+                
+                # Send the draft
+                print("📤 Sending reply...")
+                send_draft_message(draft_id)
+                
+                if args.json:
+                    print(json.dumps({"success": True, "message": "Reply sent successfully"}))
+                else:
+                    print("✓ Reply sent successfully")
+            
+            elif not has_extra_recipients and not has_attachments:
                 # Standard reply: use reply_email which auto-extracts sender from original message
                 reply_email(
                     message_id=args.message_id,
@@ -2302,6 +2987,11 @@ def main():
                 else:
                     print("✓ Reply sent successfully")
             else:
+                # Note: If attachments are specified, we must use batch_reply_email
+                # because native reply endpoint doesn't support attachments
+                if has_attachments and not has_extra_recipients:
+                    print("ℹ️  Note: Using custom reply mode to support attachments")
+                
                 result = batch_reply_email(
                     message_id=args.message_id,
                     body=args.body,
@@ -2309,7 +2999,8 @@ def main():
                     cc=parse_email_list(args.cc) if args.cc else None,
                     bcc=parse_email_list(args.bcc) if args.bcc else None,
                     csv_path=getattr(args, 'csv_path', None),
-                    email_column=getattr(args, 'email_column', None)
+                    email_column=getattr(args, 'email_column', None),
+                    attachments=inline_attachments
                 )
                 if args.json:
                     print(json.dumps(result, indent=2))
@@ -2419,6 +3110,42 @@ def main():
                     print(json.dumps({"success": True, "attachments": attachments, "total": len(attachments)}, indent=2, default=str))
                 else:
                     display_attachments(attachments)
+        
+        elif args.command == "accept-invite":
+            try:
+                accept_meeting_invite(
+                    message_id=args.message_id,
+                    comment=args.comment,
+                    send_response=not args.no_send
+                )
+                if args.json:
+                    print(json.dumps({"success": True, "message": "Meeting invite accepted"}))
+                else:
+                    print("✓ Meeting invite accepted")
+            except ValueError as e:
+                if args.json:
+                    print(json.dumps({"success": False, "error": str(e)}))
+                else:
+                    print(f"✗ Error: {e}")
+                sys.exit(1)
+        
+        elif args.command == "decline-invite":
+            try:
+                decline_meeting_invite(
+                    message_id=args.message_id,
+                    comment=args.comment,
+                    send_response=not args.no_send
+                )
+                if args.json:
+                    print(json.dumps({"success": True, "message": "Meeting invite declined"}))
+                else:
+                    print("✓ Meeting invite declined")
+            except ValueError as e:
+                if args.json:
+                    print(json.dumps({"success": False, "error": str(e)}))
+                else:
+                    print(f"✗ Error: {e}")
+                sys.exit(1)
     
     except ValueError as e:
         if args.json:

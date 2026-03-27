@@ -122,16 +122,23 @@ def list_events(
     params = {
         "$top": limit,
         "$orderby": "start/dateTime",
-        "$select": "id,subject,start,end,organizer,attendees,isAllDay,location"
+        "$select": "id,subject,start,end,organizer,attendees,isAllDay,location,responseStatus"
     }
     
-    # Set default time range if not provided
+    # Build filter query for date range
+    filter_parts = []
+    
     if start or end:
-        params["startDateTime"] = parse_datetime(start) if start else datetime.now().isoformat()
-        params["endDateTime"] = parse_datetime(end) if end else (datetime.now() + timedelta(days=30)).isoformat()
+        start_iso = parse_datetime(start) if start else datetime.now().isoformat()
+        end_iso = parse_datetime(end) if end else (datetime.now() + timedelta(days=30)).isoformat()
+        filter_parts.append(f"start/dateTime ge '{start_iso}'")
+        filter_parts.append(f"end/dateTime le '{end_iso}'")
     
     if filter_query:
-        params["$filter"] = filter_query
+        filter_parts.append(filter_query)
+    
+    if filter_parts:
+        params["$filter"] = " and ".join(filter_parts)
     
     response = requests.get(url, headers=get_headers(token), params=params)
     
@@ -703,6 +710,94 @@ def get_availability(
     return response.json()
 
 
+def get_users_info(
+    emails: List[str],
+    token: str = None
+) -> Dict[str, str]:
+    """
+    Get display names for a list of email addresses.
+    
+    Args:
+        emails: List of email addresses
+        token: Access token
+    
+    Returns:
+        Dictionary mapping email to display name
+    """
+    if token is None:
+        token = get_access_token()
+    
+    email_to_name = {}
+    
+    for email in emails:
+        try:
+            # Use $filter to find user by email
+            url = f"{GRAPH_API_BASE}/users/{email}?$select=displayName,mail"
+            response = requests.get(url, headers=get_headers(token))
+            
+            if response.status_code == 200:
+                data = response.json()
+                display_name = data.get('displayName', email.split('@')[0])
+                email_to_name[email] = display_name
+            else:
+                # Fallback to short name from email (silently, could be rate limit)
+                email_to_name[email] = email.split('@')[0]
+        except Exception as e:
+            # Fallback to short name from email (silently)
+            email_to_name[email] = email.split('@')[0]
+    
+    return email_to_name
+
+
+def get_user_working_hours(
+    email: str,
+    token: str = None
+) -> Dict[str, Any]:
+    """
+    Get user's working hours configuration from mailbox settings.
+    
+    Args:
+        email: User email address
+        token: Access token
+    
+    Returns:
+        Working hours information including timezone and time ranges
+    """
+    if token is None:
+        token = get_access_token()
+    
+    # For other users, we can't access their mailbox settings directly
+    # We'll use a default working hours (9:00-18:00) if we can't get their settings
+    # Only the current user's settings can be retrieved
+    
+    url = f"{GRAPH_API_BASE}/me/mailboxSettings"
+    
+    try:
+        response = requests.get(url, headers=get_headers(token))
+        
+        if response.status_code == 200:
+            data = response.json()
+            working_hours = data.get('workingHours', {})
+            return {
+                'email': email,
+                'timezone': working_hours.get('timeZone', {}).get('name', 'UTC'),
+                'daysOfWeek': working_hours.get('daysOfWeek', ['monday', 'tuesday', 'wednesday', 'thursday', 'friday']),
+                'startTime': working_hours.get('startTime', '09:00:00'),
+                'endTime': working_hours.get('endTime', '18:00:00')
+            }
+    except:
+        pass
+    
+    # Default working hours if we can't retrieve
+    return {
+        'email': email,
+        'timezone': 'UTC',
+        'daysOfWeek': ['monday', 'tuesday', 'wednesday', 'thursday', 'friday'],
+        'startTime': '09:00:00',
+        'endTime': '18:00:00'
+    }
+
+
 def suggest_meeting_times(
     attendees: List[str],
     duration_minutes: int = 60,
@@ -985,35 +1080,181 @@ def list_calendars(token: str = None) -> List[Dict[str, Any]]:
 # DISPLAY HELPERS
 # =============================================================================
 
-def display_event_list(events: List[Dict]):
-    """Display a list of events in a readable format."""
-    print(f"\n{'='*80}")
-    print(f"{'Start':<25} {'Subject':<40} {'Location':<20}")
-    print(f"{'='*80}")
+def display_event_list(events: List[Dict], timezone: str = 'Asia/Shanghai'):
+    """Display a list of events in a readable format with timezone conversion."""
+    from zoneinfo import ZoneInfo
     
-    for event in events:
-        start_dt = event.get('start', {}).get('dateTime', '')
-        if start_dt:
+    print(f"\n{'='*120}")
+    
+    # Parse timezone
+    if timezone.startswith('+') or timezone.startswith('-'):
+        tz = None
+        tz_offset = timezone
+    else:
+        tz = ZoneInfo(timezone)
+        tz_offset = None
+    
+    for i, event in enumerate(events, 1):
+        start_dt_str = event.get('start', {}).get('dateTime', '')
+        end_dt_str = event.get('end', {}).get('dateTime', '')
+        
+        if start_dt_str:
             # Handle Microsoft Graph date format with 7 decimal places
-            # Truncate to 6 decimal places for Python compatibility
-            if '.' in start_dt:
-                parts = start_dt.split('.')
-                fractional = parts[1].rstrip('Z')[:6]
-                start_dt = f"{parts[0]}.{fractional}"
+            if '.' in start_dt_str:
+                start_dt_str = start_dt_str.split('.')[0]
             try:
-                dt = datetime.fromisoformat(start_dt.replace('Z', '+00:00'))
-                start_str = dt.strftime('%Y-%m-%d %H:%M')
+                start_dt = datetime.fromisoformat(start_dt_str).replace(tzinfo=ZoneInfo('UTC'))
+                
+                # Convert to user timezone
+                if tz_offset:
+                    # Manual offset conversion
+                    sign = 1 if tz_offset[0] == '+' else -1
+                    hours = int(tz_offset[1:3])
+                    minutes = int(tz_offset[4:6])
+                    from datetime import timedelta
+                    offset = timedelta(hours=sign*hours, minutes=sign*minutes)
+                    start_local = start_dt + offset
+                    start_str = f"{start_local.strftime('%Y-%m-%d %H:%M')} (UTC{tz_offset})"
+                else:
+                    start_local = start_dt.astimezone(tz)
+                    start_str = f"{start_local.strftime('%Y-%m-%d %H:%M')} ({timezone})"
             except ValueError:
-                start_str = start_dt[:16]
+                start_str = start_dt_str[:16]
         else:
             start_str = ''
         
-        subject = event.get('subject', '(No Subject)')[:40]
-        location = event.get('location', {}).get('displayName', '')[:20]
+        if end_dt_str:
+            if '.' in end_dt_str:
+                end_dt_str = end_dt_str.split('.')[0]
+            try:
+                end_dt = datetime.fromisoformat(end_dt_str).replace(tzinfo=ZoneInfo('UTC'))
+                
+                # Convert to user timezone
+                if tz_offset:
+                    sign = 1 if tz_offset[0] == '+' else -1
+                    hours = int(tz_offset[1:3])
+                    minutes = int(tz_offset[4:6])
+                    from datetime import timedelta
+                    offset = timedelta(hours=sign*hours, minutes=sign*minutes)
+                    end_local = end_dt + offset
+                    end_str = end_local.strftime('%H:%M')
+                else:
+                    end_local = end_dt.astimezone(tz)
+                    end_str = end_local.strftime('%H:%M')
+            except ValueError:
+                end_str = end_dt_str[11:16]
+        else:
+            end_str = ''
         
-        print(f"{start_str:<25} {subject:<40} {location:<20}")
+        subject = event.get('subject', '(No Subject)')
+        location = event.get('location', {}).get('displayName', '')
+        
+        # Get organizer
+        organizer = event.get('organizer', {}).get('emailAddress', {})
+        organizer_name = organizer.get('name', organizer.get('address', ''))
+        
+        # Get response status
+        response_status = event.get('responseStatus', {})
+        response = response_status.get('response', 'none')
+        status_map = {
+            'accepted': '✅ Accepted',
+            'tentativelyAccepted': '❓ Tentative',
+            'declined': '❌ Declined',
+            'notResponded': '⏳ Not Responded',
+            'organizer': '👤 Organizer',
+            'none': '⏳ Not Responded'
+        }
+        status_str = status_map.get(response, response)
+        
+        # Get attendees
+        attendees = event.get('attendees', [])
+        attendee_names = []
+        for att in attendees[:5]:  # Show first 5 attendees
+            email_addr = att.get('emailAddress', {})
+            name = email_addr.get('name', email_addr.get('address', ''))
+            attendee_names.append(name)
+        
+        attendee_str = ', '.join(attendee_names)
+        if len(attendees) > 5:
+            attendee_str += f' (+{len(attendees)-5} more)'
+        
+        print(f"\n{i}. {subject}")
+        
+        # For not responded meetings, check availability and show recommendation
+        if response in ['notResponded', 'none'] and start_dt_str and end_dt_str:
+            try:
+                # Check availability for this time slot
+                from pathlib import Path
+                import sys
+                sys.path.insert(0, str(Path(__file__).parent))
+                
+                # Get current user's email
+                token = get_access_token()
+                headers = {
+                    'Authorization': f'Bearer {token}',
+                    'Content-Type': 'application/json'
+                }
+                response_data = requests.get(
+                    'https://graph.microsoft.com/v1.0/me',
+                    headers=headers
+                )
+                my_email = response_data.json().get('mail', response_data.json().get('userPrincipalName', ''))
+                
+                # Check availability
+                avail_result = get_availability(
+                    emails=[my_email],
+                    start=start_dt.isoformat(),
+                    end=end_dt.isoformat(),
+                    timezone='UTC'
+                )
+                
+                # Parse availability
+                schedules = avail_result.get('value', [])
+                availability_status = "❓ Unknown"
+                recommendation = ""
+                
+                if schedules:
+                    schedule = schedules[0]
+                    schedule_items = schedule.get('scheduleItems', [])
+                    
+                    # Get this event's subject
+                    current_subject = subject.strip()
+                    
+                    # Check if there are any OTHER events (excluding this one by subject)
+                    other_events = []
+                    for item in schedule_items:
+                        item_subject = item.get('subject', '').strip()
+                        
+                        # Skip if this is the same event (match by subject)
+                        if item_subject.lower() == current_subject.lower():
+                            continue
+                        
+                        other_events.append(item)
+                    
+                    if not other_events:
+                        availability_status = "✅ Free"
+                        recommendation = " → 建议接受"
+                    else:
+                        availability_status = f"❌ Busy ({len(other_events)} conflict{'s' if len(other_events) > 1 else ''})"
+                        recommendation = " → 不建议接受"
+                
+                print(f"   Time: {start_str} - {end_str} {availability_status}{recommendation}")
+            except Exception as e:
+                # If availability check fails, just show time without recommendation
+                print(f"   Time: {start_str} - {end_str}")
+        else:
+            # For accepted/declined/tentative meetings, just show time
+            print(f"   Time: {start_str} - {end_str}")
+        
+        print(f"   Status: {status_str}")
+        if organizer_name:
+            print(f"   Organizer: {organizer_name}")
+        if location:
+            print(f"   Location: {location}")
+        if attendee_str:
+            print(f"   Attendees: {attendee_str}")
     
-    print(f"{'='*80}")
+    print(f"\n{'='*120}")
     print(f"Total: {len(events)} events")
 
 
@@ -1042,22 +1283,568 @@ def display_event(event: Dict):
     print(f"\n{'='*80}")
 
 
-def display_availability(data: Dict):
-    """Display availability information."""
-    print(f"\n{'='*80}")
-    print("Availability Information")
-    print(f"{'='*80}")
+def display_availability(data: Dict, timezone: str = 'UTC', query_start: str = None, query_end: str = None):
+    """Display availability information with timezone conversion and multi-person comparison."""
+    from zoneinfo import ZoneInfo
+    from datetime import datetime, timedelta
     
-    for schedule in data.get("value", []):
+    print(f"\n{'='*120}")
+    print("Availability Information")
+    print(f"{'='*120}")
+    
+    # Parse timezone
+    if timezone.startswith('+') or timezone.startswith('-'):
+        # Offset format like +08:00
+        tz = ZoneInfo('UTC')
+        tz_offset = timezone
+    else:
+        # Named timezone like Asia/Shanghai
+        tz = ZoneInfo(timezone)
+        tz_offset = None
+    
+    # Calculate query start time slot index (for mapping availabilityView indices to actual time slots)
+    query_start_slot = 0
+    if query_start:
+        try:
+            # Parse query start time
+            query_start_dt = datetime.fromisoformat(query_start.replace('Z', '+00:00'))
+            if query_start_dt.tzinfo is None:
+                query_start_dt = query_start_dt.replace(tzinfo=tz)
+            else:
+                query_start_dt = query_start_dt.astimezone(tz)
+            # Calculate slot index from midnight (each slot is 30 minutes)
+            query_start_slot = query_start_dt.hour * 2 + (1 if query_start_dt.minute >= 30 else 0)
+        except:
+            query_start_slot = 0
+    
+    schedules = data.get("value", [])
+    
+    # Get all email addresses and fetch display names
+    all_emails = [schedule.get("scheduleId", "Unknown") for schedule in schedules]
+    email_to_name = get_users_info(all_emails)
+    
+    # Extract time range from availability data to fetch full event details
+    # We'll fetch events for the current user to get complete information
+    time_range_start = None
+    time_range_end = None
+    
+    for schedule in schedules:
+        schedule_items = schedule.get("scheduleItems", [])
+        for item in schedule_items:
+            start_info = item.get('start', {})
+            end_info = item.get('end', {})
+            start_dt_str = start_info.get('dateTime', '')
+            end_dt_str = end_info.get('dateTime', '')
+            
+            if start_dt_str:
+                try:
+                    if '.' in start_dt_str:
+                        start_dt_str = start_dt_str.split('.')[0]
+                    start_dt = datetime.fromisoformat(start_dt_str)
+                    if time_range_start is None or start_dt < time_range_start:
+                        time_range_start = start_dt
+                except:
+                    pass
+            
+            if end_dt_str:
+                try:
+                    if '.' in end_dt_str:
+                        end_dt_str = end_dt_str.split('.')[0]
+                    end_dt = datetime.fromisoformat(end_dt_str)
+                    if time_range_end is None or end_dt > time_range_end:
+                        time_range_end = end_dt
+                except:
+                    pass
+    
+    # Fetch full event details for the time range
+    full_events = {}
+    if time_range_start and time_range_end:
+        try:
+            # Add buffer to time range
+            time_range_start = time_range_start - timedelta(hours=1)
+            time_range_end = time_range_end + timedelta(hours=1)
+            
+            events = list_events(
+                start=time_range_start.strftime("%Y-%m-%dT%H:%M:%S"),
+                end=time_range_end.strftime("%Y-%m-%dT%H:%M:%S")
+            )
+            
+            # Index events by subject and start time for quick lookup
+            for event in events:
+                subject = event.get('subject', '').strip()
+                start_info = event.get('start', {})
+                start_dt_str = start_info.get('dateTime', '')
+                if start_dt_str and subject:
+                    try:
+                        if '.' in start_dt_str:
+                            start_dt_str = start_dt_str.split('.')[0]
+                        start_dt = datetime.fromisoformat(start_dt_str.replace('Z', ''))
+                        # Use subject + start time as key
+                        key = f"{subject}|{start_dt.strftime('%Y-%m-%d %H:%M')}"
+                        full_events[key] = event
+                    except:
+                        pass
+        except Exception as e:
+            # If fetching full events fails, continue with limited info
+            pass
+    
+    # If multiple people, show comparison table first
+    if len(schedules) > 1:
+        print(f"\n📊 Multi-Person Availability Comparison")
+        print(f"{'='*120}")
+        
+        # Get working hours for each person from the schedule data
+        working_hours_info = {}
+        for schedule in schedules:
+            email = schedule.get("scheduleId", "Unknown")
+            working_hours = schedule.get("workingHours", {})
+            
+            # Extract working hours info
+            if working_hours:
+                tz_info = working_hours.get('timeZone', {})
+                timezone_name = tz_info.get('name', 'UTC') if isinstance(tz_info, dict) else str(tz_info)
+                start_time = working_hours.get('startTime', '09:00:00')
+                end_time = working_hours.get('endTime', '18:00:00')
+            else:
+                # Default working hours
+                timezone_name = 'UTC'
+                start_time = '09:00:00'
+                end_time = '18:00:00'
+            
+            working_hours_info[email] = {
+                'timezone': timezone_name,
+                'start': start_time,
+                'end': end_time
+            }
+        
+        # Display working hours for each person (converted to display timezone)
+        print(f"\n⏰ Working Hours (in {timezone}):")
+        for email, wh in working_hours_info.items():
+            display_name = email_to_name.get(email, email.split('@')[0])
+            wh_tz_name = wh['timezone']
+            wh_start_str = wh['start']
+            wh_end_str = wh['end']
+            
+            try:
+                from zoneinfo import ZoneInfo
+                from datetime import datetime
+                
+                # Map Windows timezone names to IANA timezone names
+                tz_map = {
+                    'China Standard Time': 'Asia/Shanghai',
+                    'India Standard Time': 'Asia/Kolkata',
+                    'Singapore Standard Time': 'Asia/Singapore',
+                    'Pacific Standard Time': 'America/Los_Angeles',
+                    'Eastern Standard Time': 'America/New_York',
+                    'GMT Standard Time': 'Europe/London',
+                    'UTC': 'UTC'
+                }
+                
+                iana_tz_name = tz_map.get(wh_tz_name, wh_tz_name)
+                wh_start_time = datetime.strptime(wh_start_str[:5], '%H:%M').time()
+                wh_end_time = datetime.strptime(wh_end_str[:5], '%H:%M').time()
+                
+                today = datetime.now(ZoneInfo(iana_tz_name)).date()
+                wh_start_dt = datetime.combine(today, wh_start_time, tzinfo=ZoneInfo(iana_tz_name))
+                wh_end_dt = datetime.combine(today, wh_end_time, tzinfo=ZoneInfo(iana_tz_name))
+                
+                display_tz = ZoneInfo(timezone)
+                wh_start_display = wh_start_dt.astimezone(display_tz)
+                wh_end_display = wh_end_dt.astimezone(display_tz)
+                
+                print(f"  {display_name}: {wh_start_display.strftime('%H:%M')} - {wh_end_display.strftime('%H:%M')} (originally {wh_start_str[:5]}-{wh_end_str[:5]} {wh_tz_name})")
+            except Exception as e:
+                # Fallback to original display
+                print(f"  {display_name}: {wh_start_str[:5]} - {wh_end_str[:5]} ({wh_tz_name})")
+        
+        # Get all availability views
+        all_views = []
+        all_display_names = []
+        for schedule in schedules:
+            email = schedule.get("scheduleId", "Unknown")
+            availability = schedule.get("availabilityView", "")
+            display_name = email_to_name.get(email, email.split('@')[0])
+            all_display_names.append(display_name)
+            all_views.append(availability)
+        
+        # Find common free slots
+        if all_views and all_views[0]:
+            view_length = len(all_views[0])
+            common_free_slots = []
+            
+            for i in range(view_length):
+                all_free = all(view[i] == '0' if i < len(view) else False for view in all_views)
+                if all_free:
+                    common_free_slots.append(i)
+            
+            # Group consecutive slots and filter by working hours (9:00-18:00)
+            if common_free_slots:
+                # Filter slots within working hours (9:00-18:00 = slots 18-36)
+                # Each slot is 30 minutes, so 9:00 = slot 18, 18:00 = slot 36
+                working_hours_slots = [slot for slot in common_free_slots if 18 <= slot < 36]
+                
+                if working_hours_slots:
+                    print(f"\n✅ Common Free Time Slots (Working Hours 9:00-18:00):")
+                    slot_groups = []
+                    current_group = [working_hours_slots[0]]
+                    
+                    for slot in working_hours_slots[1:]:
+                        if slot == current_group[-1] + 1:
+                            current_group.append(slot)
+                        else:
+                            slot_groups.append(current_group)
+                            current_group = [slot]
+                    slot_groups.append(current_group)
+                    
+                    # Display time ranges (assuming each slot is 30 minutes)
+                    time_slots_info = []
+                    for group in slot_groups:
+                        start_mins = group[0] * 30
+                        end_mins = (group[-1] + 1) * 30
+                        start_time = f"{start_mins // 60:02d}:{start_mins % 60:02d}"
+                        end_time = f"{end_mins // 60:02d}:{end_mins % 60:02d}"
+                        duration = len(group) * 30
+                        time_slots_info.append((start_time, end_time, duration, start_mins // 60))
+                        print(f"  • {start_time} - {end_time} ({duration} min)")
+                    
+                else:
+                    print(f"\n❌ No common free time slots found during working hours (9:00-18:00)")
+            else:
+                print(f"\n❌ No common free time slots found")
+        
+        # Show visual comparison with working hours overlay
+        print(f"\n📅 Time Slot Comparison (each character = 30 min, displayed in {timezone}):")
+        print(f"   Legend: 0=Free ✅  1=Tentative ❓  2=Busy 🔴  3=OOF 🏖️  4=WorkElsewhere 💼  ⬛=Out of Office Hours")
+        print()
+        
+        max_name_len = max(len(name) for name in all_display_names)
+        
+        for display_name, view in zip(all_display_names, all_views):
+            # Get email for this display name (reverse lookup)
+            email = None
+            for e, n in email_to_name.items():
+                if n == display_name:
+                    email = e
+                    break
+            if email is None:
+                # Fallback: try to find by matching short name
+                for e in email_to_name.keys():
+                    if e.split('@')[0] == display_name:
+                        email = e
+                        break
+            # Get working hours for this person (only if we found the email)
+            wh = working_hours_info.get(email, {}) if email else {}
+            wh_start_str = wh.get('start', '09:00:00')
+            wh_end_str = wh.get('end', '18:00:00')
+            wh_tz_name = wh.get('timezone', 'UTC')
+            
+            # Convert working hours to display timezone
+            try:
+                from zoneinfo import ZoneInfo
+                from datetime import datetime, time
+                
+                # Map Windows timezone names to IANA timezone names
+                tz_map = {
+                    'China Standard Time': 'Asia/Shanghai',
+                    'India Standard Time': 'Asia/Kolkata',
+                    'Singapore Standard Time': 'Asia/Singapore',
+                    'Pacific Standard Time': 'America/Los_Angeles',
+                    'Eastern Standard Time': 'America/New_York',
+                    'GMT Standard Time': 'Europe/London',
+                    'UTC': 'UTC'
+                }
+                
+                # Get IANA timezone name
+                iana_tz_name = tz_map.get(wh_tz_name, wh_tz_name)
+                
+                # Parse working hours
+                wh_start_time = datetime.strptime(wh_start_str[:5], '%H:%M').time()
+                wh_end_time = datetime.strptime(wh_end_str[:5], '%H:%M').time()
+                
+                # Create datetime objects for today in person's timezone
+                today = datetime.now(ZoneInfo(iana_tz_name)).date()
+                wh_start_dt = datetime.combine(today, wh_start_time, tzinfo=ZoneInfo(iana_tz_name))
+                wh_end_dt = datetime.combine(today, wh_end_time, tzinfo=ZoneInfo(iana_tz_name))
+                
+                # Convert to display timezone
+                display_tz = ZoneInfo(timezone)
+                wh_start_display = wh_start_dt.astimezone(display_tz)
+                wh_end_display = wh_end_dt.astimezone(display_tz)
+                
+                # Calculate slot indices (each slot is 30 minutes, starting from 00:00)
+                start_slot = wh_start_display.hour * 2 + (1 if wh_start_display.minute >= 30 else 0)
+                end_slot = wh_end_display.hour * 2 + (1 if wh_end_display.minute >= 30 else 0)
+                
+                # Build the colored view with out-of-office markers
+                colored_chars = []
+                for i, char in enumerate(view):
+                    # Calculate actual slot index (i is relative to query start time)
+                    actual_slot = query_start_slot + i
+                    
+                    # Check if this slot is within working hours
+                    if actual_slot < start_slot or actual_slot >= end_slot:
+                        # Out of office hours
+                        colored_chars.append('⬛')
+                    else:
+                        # Within working hours, use normal coloring
+                        if char == '0':
+                            colored_chars.append('✅')
+                        elif char == '1':
+                            colored_chars.append('❓')
+                        elif char == '2':
+                            colored_chars.append('🔴')
+                        elif char == '3':
+                            colored_chars.append('🏖️')
+                        elif char == '4':
+                            colored_chars.append('💼')
+                        else:
+                            colored_chars.append(char)
+                
+                colored_view = ''.join(colored_chars)
+                
+                # Format working hours in display timezone
+                wh_display_str = f"{wh_start_display.strftime('%H:%M')}-{wh_end_display.strftime('%H:%M')} {timezone}"
+                
+            except Exception as e:
+                # Fallback to simple coloring if timezone conversion fails
+                colored_view = view.replace('0', '✅').replace('1', '❓').replace('2', '🔴').replace('3', '🏖️').replace('4', '💼')
+                wh_display_str = f"{wh_start_str[:5]}-{wh_end_str[:5]} {wh_tz_name}"
+            
+            # Extract short name from email (e.g., "luomn" from "luomn@cn.ibm.com")
+            print(f"  {display_name:<{max_name_len}} | {colored_view}  [{wh_display_str}]")
+        
+        # Add smart meeting suggestions based on individual slot analysis
+        if len(schedules) > 1 and all_views:
+            print(f"\n💡 Smart Meeting Suggestions (sorted by availability):")
+            
+            # Analyze each 30-min slot
+            slot_analysis = []
+            view_length = len(all_views[0]) if all_views else 0
+            
+            # Get working hours info for each person
+            person_working_hours = {}
+            for email in all_emails:
+                wh = working_hours_info.get(email, {})
+                wh_start_str = wh.get('start', '09:00:00')
+                wh_end_str = wh.get('end', '18:00:00')
+                wh_tz_name = wh.get('timezone', 'UTC')
+                
+                try:
+                    from zoneinfo import ZoneInfo
+                    from datetime import datetime
+                    
+                    tz_map = {
+                        'China Standard Time': 'Asia/Shanghai',
+                        'India Standard Time': 'Asia/Kolkata',
+                        'Singapore Standard Time': 'Asia/Singapore',
+                        'Pacific Standard Time': 'America/Los_Angeles',
+                        'Eastern Standard Time': 'America/New_York',
+                        'GMT Standard Time': 'Europe/London',
+                        'UTC': 'UTC'
+                    }
+                    
+                    iana_tz_name = tz_map.get(wh_tz_name, wh_tz_name)
+                    wh_start_time = datetime.strptime(wh_start_str[:5], '%H:%M').time()
+                    wh_end_time = datetime.strptime(wh_end_str[:5], '%H:%M').time()
+                    
+                    today = datetime.now(ZoneInfo(iana_tz_name)).date()
+                    wh_start_dt = datetime.combine(today, wh_start_time, tzinfo=ZoneInfo(iana_tz_name))
+                    wh_end_dt = datetime.combine(today, wh_end_time, tzinfo=ZoneInfo(iana_tz_name))
+                    
+                    display_tz = ZoneInfo(timezone)
+                    wh_start_display = wh_start_dt.astimezone(display_tz)
+                    wh_end_display = wh_end_dt.astimezone(display_tz)
+                    
+                    start_slot = wh_start_display.hour * 2 + (1 if wh_start_display.minute >= 30 else 0)
+                    end_slot = wh_end_display.hour * 2 + (1 if wh_end_display.minute >= 30 else 0)
+                    
+                    person_working_hours[email] = (start_slot, end_slot)
+                except:
+                    person_working_hours[email] = (18, 36)  # Default 9:00-18:00
+            
+            # Analyze each slot
+            for slot_idx in range(view_length):
+                # Calculate actual slot index (slot_idx is relative to query start time)
+                actual_slot = query_start_slot + slot_idx
+                
+                # Check if slot is within ALL people's working hours
+                in_all_working_hours = all(
+                    start <= actual_slot < end
+                    for start, end in person_working_hours.values()
+                )
+                
+                if not in_all_working_hours:
+                    continue
+                
+                # Count how many people are free in this slot
+                free_count = sum(
+                    1 for view in all_views
+                    if slot_idx < len(view) and view[slot_idx] == '0'
+                )
+                
+                # Calculate time using actual slot index
+                slot_mins = actual_slot * 30
+                slot_time = f"{slot_mins // 60:02d}:{slot_mins % 60:02d}"
+                
+                slot_analysis.append((slot_time, free_count, len(all_emails)))
+            
+            # Sort by free count (descending) and then by time
+            slot_analysis.sort(key=lambda x: (-x[1], x[0]))
+            
+            # Display top 10 slots
+            displayed = 0
+            for slot_time, free_count, total_count in slot_analysis:
+                if displayed >= 10:
+                    break
+                if free_count > 0:
+                    percentage = (free_count / total_count) * 100
+                    print(f"  • {slot_time}: {free_count}/{total_count} people free ({percentage:.0f}%)")
+                    displayed += 1
+        
+        print(f"\n{'='*120}")
+    
+    # For multi-person availability, we only show the comparison view
+    # Individual event details are not shown to keep output concise
+    if len(schedules) == 1:
+        # For single person, show detailed information
+        schedule = schedules[0]
         email = schedule.get("scheduleId", "Unknown")
         availability = schedule.get("availabilityView", "No data")
-        print(f"\n{email}:")
-        print(f"  Availability View: {availability[:50]}{'...' if len(availability) > 50 else ''}")
         
-        for item in schedule.get("scheduleItems", []):
-            print(f"  - {item.get('subject', 'Busy')}: {item.get('start')} - {item.get('end')}")
+        # Determine overall recommendation based on availability view
+        overall_recommendation = ""
+        if availability and availability != "No data":
+            if '2' in availability or '3' in availability:
+                overall_recommendation = " → ❌ 不建议接受 (有时间冲突)"
+            elif '1' in availability:
+                overall_recommendation = " → ❓ 待定 (有待定会议)"
+            elif '4' in availability:
+                overall_recommendation = " → 💼 谨慎考虑 (Working Elsewhere)"
+            elif availability == '0' * len(availability):
+                overall_recommendation = " → ✅ 建议接受 (完全空闲)"
+        
+        print(f"\n{email}:")
+        print(f"  Availability View: {availability}{overall_recommendation}")
+        
+        schedule_items = schedule.get("scheduleItems", [])
+        if not schedule_items:
+            print(f"  No scheduled items")
+        else:
+            for i, item in enumerate(schedule_items, 1):
+                subject = item.get('subject', 'Busy')
+                status = item.get('status', 'busy')
+                
+                # Parse start and end times
+                start_info = item.get('start', {})
+                end_info = item.get('end', {})
+                
+                start_dt_str = start_info.get('dateTime', '')
+                end_dt_str = end_info.get('dateTime', '')
+                
+                if start_dt_str and end_dt_str:
+                    try:
+                        # Parse datetime
+                        if '.' in start_dt_str:
+                            start_dt_str = start_dt_str.split('.')[0]
+                        if '.' in end_dt_str:
+                            end_dt_str = end_dt_str.split('.')[0]
+                        
+                        start_dt = datetime.fromisoformat(start_dt_str).replace(tzinfo=ZoneInfo('UTC'))
+                        end_dt = datetime.fromisoformat(end_dt_str).replace(tzinfo=ZoneInfo('UTC'))
+                        
+                        # Convert to user timezone
+                        if tz_offset:
+                            start_local = start_dt
+                            end_local = end_dt
+                            time_str = f"{start_local.strftime('%Y-%m-%d %H:%M')} - {end_local.strftime('%H:%M')} UTC"
+                            if tz_offset != '+00:00':
+                                sign = 1 if tz_offset[0] == '+' else -1
+                                hours = int(tz_offset[1:3])
+                                minutes = int(tz_offset[4:6])
+                                offset = timedelta(hours=sign*hours, minutes=sign*minutes)
+                                start_local = start_dt + offset
+                                end_local = end_dt + offset
+                                time_str = f"{start_local.strftime('%Y-%m-%d %H:%M')} - {end_local.strftime('%H:%M')} (UTC{tz_offset})"
+                        else:
+                            start_local = start_dt.astimezone(tz)
+                            end_local = end_dt.astimezone(tz)
+                            time_str = f"{start_local.strftime('%Y-%m-%d %H:%M')} - {end_local.strftime('%H:%M')} ({timezone})"
+                        
+                        # Duration
+                        duration = end_dt - start_dt
+                        duration_mins = int(duration.total_seconds() / 60)
+                        
+                        # Status emoji
+                        status_map = {
+                            'free': '✅',
+                            'tentative': '❓',
+                            'busy': '🔴',
+                            'oof': '🏖️',
+                            'workingElsewhere': '💼'
+                        }
+                        status_emoji = status_map.get(status, '⏰')
+                        
+                        # Try to find full event details
+                        event_key = f"{subject}|{start_dt.strftime('%Y-%m-%d %H:%M')}"
+                        full_event = full_events.get(event_key)
+                        
+                        # Recommendation based on status
+                        if status == 'free':
+                            recommendation = "✅ 建议接受 (Free - 可以接受)"
+                        elif status == 'tentative':
+                            recommendation = "❓ 待定 (Tentative - 已有待定会议)"
+                        elif status == 'busy':
+                            recommendation = "❌ 不建议接受 (Busy - 时间冲突)"
+                        elif status == 'oof':
+                            recommendation = "🏖️ 不建议接受 (Out of Office)"
+                        elif status == 'workingElsewhere':
+                            recommendation = "💼 谨慎考虑 (Working Elsewhere)"
+                        else:
+                            recommendation = ""
+                        
+                        print(f"\n  {i}. {status_emoji} {subject}")
+                        print(f"     Time: {time_str}")
+                        print(f"     Status: {status}")
+                        
+                        # Display full event details if available
+                        if full_event:
+                            organizer = full_event.get('organizer', {}).get('emailAddress', {})
+                            organizer_name = organizer.get('name', organizer.get('address', 'Unknown'))
+                            print(f"     Organizer: {organizer_name}")
+                            
+                            location = full_event.get('location', {})
+                            if location:
+                                location_name = location.get('displayName', '')
+                                if location_name:
+                                    print(f"     Location: {location_name}")
+                            
+                            attendees = full_event.get('attendees', [])
+                            if attendees:
+                                attendee_names = []
+                                for att in attendees[:5]:
+                                    email_addr = att.get('emailAddress', {})
+                                    name = email_addr.get('name', email_addr.get('address', ''))
+                                    if name:
+                                        attendee_names.append(name)
+                                if attendee_names:
+                                    attendee_str = ', '.join(attendee_names)
+                                    if len(attendees) > 5:
+                                        attendee_str += f" (+{len(attendees) - 5} more)"
+                                    print(f"     Attendees: {attendee_str}")
+                        
+                        if recommendation:
+                            print(f"     {recommendation}")
+                        
+                    except Exception as e:
+                        print(f"\n  {i}. {subject}")
+                        print(f"     Start: {start_dt_str}")
+                        print(f"     End: {end_dt_str}")
+                        print(f"     (Error parsing time: {e})")
+                else:
+                    print(f"\n  {i}. {subject}")
+                    print(f"     Status: {status}")
     
-    print(f"\n{'='*80}")
+    print(f"\n{'='*120}")
 
 
 # =============================================================================
@@ -1077,6 +1864,7 @@ def main():
     list_parser.add_argument("--start", help="Start datetime")
     list_parser.add_argument("--end", help="End datetime")
     list_parser.add_argument("--limit", type=int, default=25, help="Max events")
+    list_parser.add_argument("--timezone", default="Asia/Shanghai", help="Display timezone (default: Asia/Shanghai)")
     
     # Get command
     get_parser = subparsers.add_parser("get", help="Get an event")
@@ -1177,7 +1965,7 @@ def main():
             if args.json:
                 print(json.dumps({"success": True, "events": events, "total": len(events)}, indent=2, default=str))
             else:
-                display_event_list(events)
+                display_event_list(events, timezone=args.timezone if hasattr(args, 'timezone') and args.timezone else 'Asia/Shanghai')
         
         elif args.command == "get":
             event = get_event(args.event_id)
@@ -1245,7 +2033,7 @@ def main():
             if args.json:
                 print(json.dumps({"success": True, "availability": data}, indent=2, default=str))
             else:
-                display_availability(data)
+                display_availability(data, timezone=args.timezone if hasattr(args, 'timezone') and args.timezone else 'UTC', query_start=args.start, query_end=args.end)
         
         elif args.command == "calendars":
             calendars = list_calendars()
