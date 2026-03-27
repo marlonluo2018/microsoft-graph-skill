@@ -40,6 +40,11 @@ from config import (
 )
 from auth import get_access_token
 
+# NOTE: Time filtering is supported via --since argument.
+# Pass a UTC timestamp (e.g., "2026-03-26T04:00:00Z") to filter messages received after that time.
+# Timezone offset is also accepted (e.g., "2026-03-26T12:00:00+08:00") and will be converted to UTC.
+# If not specified, all messages are returned (subject to --limit).
+
 # Try to import requests
 try:
     import requests
@@ -58,6 +63,9 @@ def get_headers(token: str) -> Dict[str, str]:
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
+
+
+
 
 
 def api_request(
@@ -263,7 +271,9 @@ def list_messages(
     to_recipient: str = None,
     subject: str = None,
     body: str = None,
-    token: str = None
+    token: str = None,
+    since: str = None,
+    before: str = None
 ) -> List[Dict[str, Any]]:
     """
     List/search messages from a folder with optional search criteria.
@@ -280,6 +290,8 @@ def list_messages(
         subject: Search by subject text
         body: Search by body text
         token: Access token (will obtain if not provided)
+        since: ISO 8601 timestamp to filter messages received AFTER this time (requires timezone)
+        before: ISO 8601 timestamp to filter messages received BEFORE this time (requires timezone)
     
     Returns:
         List of message objects
@@ -351,20 +363,41 @@ def list_messages(
     }
     
     # If search criteria provided, use $search
+    # Track if since is handled in $search (KQL syntax) to avoid duplicate filtering
+    since_in_search = False
+    
     if has_search_criteria:
         search_keywords = []
         if from_sender:
-            search_keywords.append(from_sender)
+            search_keywords.append(f"from:{from_sender}")
         if to_recipient:
-            search_keywords.append(to_recipient)
+            search_keywords.append(f"to:{to_recipient}")
         if subject:
-            search_keywords.append(subject)
+            search_keywords.append(f"subject:{subject}")
         if body:
             search_keywords.append(body)
         
+        # KQL: Add since to $search whenever $search is used
+        # This avoids $search + $filter conflict (Graph API doesn't allow both)
+        # NOTE: KQL only supports date format (YYYY-MM-DD), but we still require timezone for validation
+        if since:
+            # Validate timezone first (strict requirement)
+            if not (since.endswith('Z') or '+' in since or (since.count('-') > 2 and '-' in since[-6:])):
+                raise ValueError(
+                    f"TIMEZONE_REQUIRED: '{since}' is missing timezone information.\n"
+                    f"--since requires explicit timezone for unambiguous time handling.\n"
+                    f"Valid formats:\n"
+                    f"  - UTC time: '2026-03-26T04:00:00Z'\n"
+                    f"  - With timezone offset: '2026-03-26T12:00:00+08:00'"
+                )
+            # Convert since to KQL date format (YYYY-MM-DD) - only date is supported by KQL
+            since_date = since.split('T')[0] if 'T' in since else since
+            search_keywords.append(f"received>={since_date}")
+            since_in_search = True  # Mark as handled
+        
         search_query = " ".join(search_keywords)
         params["$search"] = f'"{search_query}"'
-        params["$top"] = min(limit * 3, 100)  # Get more for client-side filtering
+        params["$top"] = limit  # No need for extra results, server filters
     else:
         params["$top"] = limit
         params["$orderby"] = order_by
@@ -379,6 +412,90 @@ def list_messages(
         if classification in ["focused", "other"]:
             filters.append(f"inferenceClassification eq '{classification}'")
     
+    # Add time filter for incremental sync (messages received after --since timestamp)
+    # STRICT UTC-ONLY design:
+    #   - UTC time (e.g., "2026-03-26T00:00:00Z") → ACCEPTED → use directly
+    #   - With timezone offset (e.g., "2026-03-26T08:00:00+08:00") → ACCEPTED → convert to UTC
+    #   - Pure date (e.g., "2026-03-26") → REJECTED (ambiguous)
+    #   - Time WITHOUT timezone (e.g., "2026-03-26T15:00:00") → REJECTED (ambiguous)
+    # NOTE: If since is already in $search (KQL), skip $filter to avoid conflict
+    since_info = None  # Track timezone conversion info for display
+    before_info = None  # Track before timezone conversion info
+    
+    def convert_timestamp_to_utc(timestamp: str, param_name: str) -> tuple:
+        """
+        Convert timestamp to UTC. Returns (utc_timestamp, timezone_offset, error).
+        timezone_offset is for display purposes (e.g., "+08:00" or "UTC").
+        """
+        if not timestamp:
+            return None, None, None
+        
+        utc_time = timestamp  # Default: assume already UTC
+        detected_tz = None
+        tz_offset = None
+        
+        try:
+            if timestamp.endswith('Z'):
+                # Already UTC - ACCEPTED
+                detected_tz = "UTC"
+                tz_offset = "UTC"
+                utc_time = timestamp
+            elif '+' in timestamp or (timestamp.count('-') > 2 and '-' in timestamp[-6:]):
+                # Has timezone offset - ACCEPTED → convert to UTC
+                local_dt = datetime.fromisoformat(timestamp)
+                detected_tz = str(local_dt.tzinfo)
+                # Extract offset string for display (e.g., "+08:00")
+                if '+' in timestamp:
+                    tz_offset = '+' + timestamp.split('+')[-1]
+                else:
+                    # Format: 2026-03-26T12:00:00-05:00 (negative offset)
+                    parts = timestamp.split('-')
+                    if len(parts) >= 3:  # Has date AND time AND offset
+                        tz_offset = '-' + parts[-1]
+                utc_time = local_dt.astimezone(ZoneInfo('UTC')).strftime('%Y-%m-%dT%H:%M:%SZ')
+            else:
+                # Pure date OR time WITHOUT timezone - REJECTED (ambiguous)
+                return None, None, (
+                    f"TIMEZONE_REQUIRED: '{timestamp}' is missing timezone information.\n"
+                    f"--{param_name} requires explicit timezone for unambiguous time handling.\n"
+                    f"Valid formats:\n"
+                    f"  - UTC time: '2026-03-26T04:00:00Z'\n"
+                    f"  - With timezone offset: '2026-03-26T12:00:00+08:00'\n"
+                    f"Example: --{param_name} '2026-03-26T04:00:00Z'"
+                )
+            
+            return utc_time, tz_offset, None
+        except (ValueError, TypeError) as e:
+            return None, None, f"Invalid timestamp format: {timestamp} - {str(e)}"
+    
+    # Process --since parameter
+    if since and not since_in_search:
+        since_utc, tz_offset, error = convert_timestamp_to_utc(since, 'since')
+        if error:
+            raise ValueError(error)
+        
+        since_info = {
+            'original': since,
+            'converted_utc': since_utc,
+            'timezone': tz_offset,
+            'timezone_offset': tz_offset
+        }
+        filters.append(f"receivedDateTime gt {since_utc}")
+    
+    # Process --before parameter
+    if before:
+        before_utc, tz_offset, error = convert_timestamp_to_utc(before, 'before')
+        if error:
+            raise ValueError(error)
+        
+        before_info = {
+            'original': before,
+            'converted_utc': before_utc,
+            'timezone': tz_offset,
+            'timezone_offset': tz_offset
+        }
+        filters.append(f"receivedDateTime lt {before_utc}")
+    
     if filters:
         params["$filter"] = " and ".join(filters)
     
@@ -387,38 +504,18 @@ def list_messages(
     data = response.json()
     messages = data.get("value", [])
     
-    # Apply client-side filtering for precise search matching
-    if has_search_criteria:
-        if from_sender:
-            from_lower = from_sender.lower()
-            messages = [
-                m for m in messages
-                if from_lower in m.get('from', {}).get('emailAddress', {}).get('name', '').lower()
-                or from_lower in m.get('from', {}).get('emailAddress', {}).get('address', '').lower()
-            ]
-        
-        if to_recipient:
-            to_lower = to_recipient.lower()
-            messages = [
-                m for m in messages
-                if any(
-                    to_lower in r.get('emailAddress', {}).get('name', '').lower()
-                    or to_lower in r.get('emailAddress', {}).get('address', '').lower()
-                    for r in m.get('toRecipients', [])
-                )
-            ]
-        
-        if subject:
-            subject_lower = subject.lower()
-            messages = [
-                m for m in messages
-                if subject_lower in m.get('subject', '').lower()
-            ]
-        
-        # Limit results after filtering
-        messages = messages[:limit]
+    # Server-side filtering is now complete via KQL $search
+    # No client-side filtering needed
     
-    return messages
+    # Build time info for display
+    time_info = None
+    if since_info or before_info:
+        time_info = {
+            'since': since_info,
+            'before': before_info
+        }
+    
+    return messages, time_info
 
 
 
@@ -491,6 +588,10 @@ def send_email(
     
     # Validate recipients
     validate_recipients(to, cc, bcc)
+    
+    # Convert plain text body to HTML if needed (for proper line breaks)
+    if body_type == "html" and not body.strip().startswith('<'):
+        body = body.replace('\n', '<br>')
     
     # Build message payload
     message = {
@@ -780,28 +881,42 @@ def reply_email(
     token: str = None
 ) -> bool:
     """
-    Reply to an email with conversation history included in body.
+    Reply to an email using Microsoft Graph's native reply endpoint.
+    
+    This preserves inline attachments (images with cid: references) automatically
+    because Microsoft handles the attachment copying internally.
     
     Args:
         message_id: ID of message to reply to
-        body: Reply body content
+        body: Reply body content (comment to add at the top)
         reply_all: If True, reply to all recipients; otherwise reply to sender only
         body_type: "html" or "text"
         include_history: If True, include original message in reply body (default: True)
-        importance: "low", "normal", or "high"
+                        Note: Graph API native reply always includes original message
+                        in the conversation thread format.
+        importance: Not supported by native reply endpoint (will show warning)
         token: Access token
     
     Returns:
         bool: True if successful
+    
+    Note:
+        Unlike the old implementation that created a new email, this uses Graph API's
+        native /reply or /replyAll endpoint which automatically:
+        - Preserves inline attachments (cid: references work correctly)
+        - Sets RE: prefix on subject
+        - Adds to the same conversation thread
+        - Maintains proper email threading
     """
     if token is None:
         token = get_access_token()
     
-    # Get original message
+    # Get original message to check if replying to self-sent email
     original_msg = get_message(message_id, token)
     
     # Check if replying to self-sent email
-    from_addr = original_msg.get('from', {}).get('emailAddress', {})
+    from_field = original_msg.get('from', {})
+    from_addr = from_field.get('emailAddress', from_field)  # Fallback to direct format
     my_email = get_my_email(token)
     
     if from_addr.get('address', '').lower() == my_email.lower():
@@ -810,58 +925,39 @@ def reply_email(
         print("   Example: forward <message_id> --to \"recipient@example.com\"")
         print()
     
-    # Determine recipients
-    from_addr = original_msg.get('from', {}).get('emailAddress', {})
-    to_recipients = []
-    cc_recipients = []
+    # Warn if importance is specified (not supported by native reply)
+    if importance:
+        print("⚠️  Note: Importance level is not supported by the native reply endpoint.")
+        print("   The reply will be sent with normal importance.")
     
-    if reply_all:
-        # Add all original To recipients (except current user)
-        my_email = get_my_email(token)
-        for recipient in original_msg.get('toRecipients', []):
-            email = recipient.get('emailAddress', {}).get('address', '')
-            if email and email.lower() != my_email.lower():
-                to_recipients.append(email)
-        
-        # Add original sender to CC
-        sender_email = from_addr.get('address')
-        if sender_email and sender_email.lower() != my_email.lower():
-            cc_recipients.append(sender_email)
-        
-        # Add all original CC recipients
-        for recipient in original_msg.get('ccRecipients', []):
-            email = recipient.get('emailAddress', {}).get('address', '')
-            if email and email.lower() != my_email.lower() and email not in cc_recipients:
-                cc_recipients.append(email)
-    else:
-        # Regular reply: only to the sender
-        to_recipients = [from_addr.get('address')]
+    # Prepare the comment/body
+    # Graph API expects the comment in a specific format
+    comment = body
     
-    # Build email body with history
-    if include_history and body_type == "html":
-        # Convert plain text body to HTML if needed
-        if not body.strip().startswith('<'):
-            body = body.replace('\n', '<br>\n')
-        
-        full_body = body + "\n\n" + format_email_as_html(original_msg)
-    else:
-        full_body = body
+    # Convert plain text to HTML if needed
+    if body_type == "html" and not comment.strip().startswith('<'):
+        # Convert literal \n strings to actual newlines (for CLI convenience)
+        comment = comment.replace('\\n', '\n')
+        # Convert plain text to HTML with proper line breaks
+        comment = comment.replace('\n', '<br>\n')
     
-    # Get subject with RE: prefix
-    subject = original_msg.get('subject', '')
-    if not subject.upper().startswith('RE:'):
-        subject = f"RE: {subject}"
+    # Determine which endpoint to use
+    # /reply - reply to sender only
+    # /replyAll - reply to all recipients
+    endpoint = "replyAll" if reply_all else "reply"
+    url = f"{GRAPH_API_BASE}/me/messages/{message_id}/{endpoint}"
     
-    # Send email using send_email function
-    return send_email(
-        to=to_recipients,
-        subject=subject,
-        body=full_body,
-        cc=cc_recipients if cc_recipients else None,
-        body_type=body_type,
-        importance=importance,
-        token=token
-    )
+    # Build payload
+    # Graph API reply endpoint expects a "comment" field
+    # The original message will be automatically included below the comment
+    payload = {
+        "comment": comment
+    }
+    
+    # Send the reply request
+    response = api_request('post', url, token, json=payload)
+    
+    return True
 
 
 def batch_reply_email(
@@ -1676,8 +1772,108 @@ def display_folder_list(folders: List[Dict]):
 # DISPLAY HELPERS
 # =============================================================================
 
-def display_message_list(messages: List[Dict], show_preview: bool = True):
-    """Display a list of messages in a readable format."""
+def display_message_list(messages: List[Dict], show_preview: bool = True, show_detail: bool = False, display_timezone: str = None):
+    """Display a list of messages in a readable format.
+    
+    Args:
+        messages: List of message dictionaries
+        show_preview: Show bodyPreview (first few lines)
+        show_detail: Show full body content (requires --detail flag to fetch full messages)
+        display_timezone: Timezone for display (e.g., "+08:00" or "UTC")
+    """
+    # Determine display timezone (default: show original UTC)
+    display_tz = None
+    if display_timezone and display_timezone != "UTC":
+        try:
+            # Parse timezone offset like "+08:00" or "-05:00"
+            import re
+            match = re.match(r'^([+-])(\d{2}):?(\d{2})?$', display_timezone)
+            if match:
+                sign = match.group(1)
+                hours = int(match.group(2))
+                # mins = int(match.group(3)) if match.group(3) else 0  # Not used for ZoneInfo
+                # ZoneInfo uses Etc/GMT convention (inverted sign)
+                if sign == '+':
+                    display_tz = ZoneInfo(f"Etc/GMT-{hours}")
+                else:
+                    display_tz = ZoneInfo(f"Etc/GMT+{hours}")
+        except Exception:
+            pass  # Fallback to UTC display
+    
+    # If show_detail is True, show full body content
+    if show_detail:
+        print(f"\n{'='*80}")
+        for i, msg in enumerate(messages, 1):
+            received = msg.get('receivedDateTime', '')
+            if received:
+                dt = datetime.fromisoformat(received.replace('Z', '+00:00'))
+                if display_tz:
+                    dt = dt.astimezone(display_tz)
+                received = dt.strftime('%Y-%m-%d %H:%M %Z').strip()
+
+            from_addr = msg.get('from', {}).get('emailAddress', {})
+            sender = from_addr.get('name', from_addr.get('address', 'Unknown'))
+
+            subject = msg.get('subject', '(No Subject)')
+            read_status = '[UNREAD] ' if not msg.get('isRead', True) else ''
+            message_id = msg.get('id', '')
+
+            print(f"\n{i}. {read_status}{subject}")
+            print(f"   From: {sender}")
+            print(f"   Date: {received}")
+            print(f"   ID: {message_id}")
+            
+            # Show To recipients
+            to_recipients = msg.get('toRecipients', [])
+            if to_recipients:
+                to_names = [r.get('emailAddress', {}).get('name', r.get('emailAddress', {}).get('address', '')) for r in to_recipients]
+                to_display = ', '.join(to_names[:3])
+                if len(to_recipients) > 3:
+                    to_display += f' (+{len(to_recipients) - 3} more)'
+                print(f"   To: {to_display}")
+            
+            # Show CC recipients
+            cc_recipients = msg.get('ccRecipients', [])
+            if cc_recipients:
+                cc_names = [r.get('emailAddress', {}).get('name', r.get('emailAddress', {}).get('address', '')) for r in cc_recipients]
+                cc_display = ', '.join(cc_names[:3])
+                if len(cc_recipients) > 3:
+                    cc_display += f' (+{len(cc_recipients) - 3} more)'
+                print(f"   Cc: {cc_display}")
+            
+            # Show full body content
+            body_content = msg.get('body', {})
+            body_text = body_content.get('content', '') if body_content else ''
+            if body_text:
+                # Clean up HTML if needed
+                if body_content.get('contentType') == 'html':
+                    # Remove script and style tags with their content
+                    import re
+                    body_text = re.sub(r'<(script|style)[^>]*>.*?</\1>', '', body_text, flags=re.DOTALL | re.IGNORECASE)
+                    # Remove HTML tags
+                    body_text = re.sub(r'<[^>]+>', '', body_text)
+                    # Decode HTML entities
+                    body_text = body_text.replace('&nbsp;', ' ').replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
+                    body_text = body_text.replace('&quot;', '"').replace('&#39;', "'").replace('&apos;', "'")
+                    # Clean up whitespace
+                    body_text = re.sub(r'[ \t]+', ' ', body_text)  # Multiple spaces to single
+                    body_text = re.sub(r'\n\s*\n\s*\n+', '\n\n', body_text)  # Multiple blank lines to double
+                    body_text = body_text.strip()
+                # Limit display to 2000 chars for readability
+                if len(body_text) > 2000:
+                    body_text = body_text[:2000] + '\n... [truncated, use --json for full content]'
+                print(f"\n   Body:\n   {'-'*40}")
+                for line in body_text.split('\n'):
+                    print(f"   {line}")
+                print(f"   {'-'*40}")
+            
+            if i < len(messages):
+                print(f"\n{'~'*80}")
+        
+        print(f"\n{'='*80}")
+        print(f"Total: {len(messages)} messages")
+        return
+    
     if not show_preview:
         # Compact table format without preview
         print(f"\n{'='*100}")
@@ -1688,9 +1884,9 @@ def display_message_list(messages: List[Dict], show_preview: bool = True):
             received = msg.get('receivedDateTime', '')
             if received:
                 dt = datetime.fromisoformat(received.replace('Z', '+00:00'))
-                # Convert to Asia/Shanghai timezone
-                dt_local = dt.astimezone(ZoneInfo('Asia/Shanghai'))
-                received = dt_local.strftime('%Y-%m-%d %H:%M')
+                if display_tz:
+                    dt = dt.astimezone(display_tz)
+                received = dt.strftime('%Y-%m-%d %H:%M %Z').strip()
 
             from_addr = msg.get('from', {}).get('emailAddress', {})
             sender = from_addr.get('name', from_addr.get('address', 'Unknown'))
@@ -1711,9 +1907,9 @@ def display_message_list(messages: List[Dict], show_preview: bool = True):
             received = msg.get('receivedDateTime', '')
             if received:
                 dt = datetime.fromisoformat(received.replace('Z', '+00:00'))
-                # Convert to Asia/Shanghai timezone
-                dt_local = dt.astimezone(ZoneInfo('Asia/Shanghai'))
-                received = dt_local.strftime('%Y-%m-%d %H:%M')
+                if display_tz:
+                    dt = dt.astimezone(display_tz)
+                received = dt.strftime('%Y-%m-%d %H:%M %Z').strip()
 
             from_addr = msg.get('from', {}).get('emailAddress', {})
             sender = from_addr.get('name', from_addr.get('address', 'Unknown'))
@@ -1807,6 +2003,17 @@ def display_message(message: Dict):
 # CLI
 # =============================================================================
 
+def unescape_body(body: str) -> str:
+    """
+    Convert escape sequences in body text to actual characters.
+    Handles: \\n -> newline, \\t -> tab, \\\\ -> backslash
+    This allows using \\n in command line arguments across all shells.
+    """
+    if not body:
+        return body
+    return body.replace('\\n', '\n').replace('\\t', '\t').replace('\\\\', '\\')
+
+
 def main():
     parser = argparse.ArgumentParser(description="Microsoft Graph Email Operations")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1821,6 +2028,7 @@ def main():
     list_parser.add_argument("--filter", dest="filter_query", help="OData filter query")
     list_parser.add_argument("--unread", action="store_true", help="Show unread only")
     list_parser.add_argument("--preview", action="store_true", help="Show email body preview")
+    list_parser.add_argument("--detail", action="store_true", help="Show full email body content (alias for --preview with more detail)")
     list_parser.add_argument("--focused", action="store_true", help="Show Focused inbox only")
     list_parser.add_argument("--other", action="store_true", help="Show Other inbox only")
     # Search parameters
@@ -1828,6 +2036,8 @@ def main():
     list_parser.add_argument("--to", dest="to_recipient", help="Search by recipient name or email")
     list_parser.add_argument("--subject", help="Search by subject text")
     list_parser.add_argument("--body", help="Search by body text")
+    list_parser.add_argument("--since", help="Filter messages received after this timestamp (required format with timezone: '2026-03-26T04:00:00Z' or '2026-03-26T12:00:00+08:00')")
+    list_parser.add_argument("--before", help="Filter messages received before this timestamp (required format with timezone: '2026-03-26T04:00:00Z' or '2026-03-26T12:00:00+08:00')")
     
     # Search command (complete alias for list, supports all parameters)
     search_parser = subparsers.add_parser("search", help="Search/list messages (alias for list)")
@@ -1836,6 +2046,7 @@ def main():
     search_parser.add_argument("--filter", dest="filter_query", help="OData filter query")
     search_parser.add_argument("--unread", action="store_true", help="Show unread only")
     search_parser.add_argument("--preview", action="store_true", help="Show email body preview")
+    search_parser.add_argument("--detail", action="store_true", help="Show full email body content (alias for --preview with more detail)")
     search_parser.add_argument("--focused", action="store_true", help="Show Focused inbox only")
     search_parser.add_argument("--other", action="store_true", help="Show Other inbox only")
     # Search parameters
@@ -1843,6 +2054,8 @@ def main():
     search_parser.add_argument("--to", dest="to_recipient", help="Search by recipient name or email")
     search_parser.add_argument("--subject", help="Search by subject text")
     search_parser.add_argument("--body", help="Search by body text")
+    search_parser.add_argument("--since", help="Filter messages received after this timestamp (required format with timezone: '2026-03-26T04:00:00Z' or '2026-03-26T12:00:00+08:00')")
+    search_parser.add_argument("--before", help="Filter messages received before this timestamp (required format with timezone: '2026-03-26T04:00:00Z' or '2026-03-26T12:00:00+08:00')")
     
     # Find command (complete alias for list, supports all parameters)
     find_parser = subparsers.add_parser("find", help="Find/list messages (alias for list)")
@@ -1851,6 +2064,7 @@ def main():
     find_parser.add_argument("--filter", dest="filter_query", help="OData filter query")
     find_parser.add_argument("--unread", action="store_true", help="Show unread only")
     find_parser.add_argument("--preview", action="store_true", help="Show email body preview")
+    find_parser.add_argument("--detail", action="store_true", help="Show full email body content (alias for --preview with more detail)")
     find_parser.add_argument("--focused", action="store_true", help="Show Focused inbox only")
     find_parser.add_argument("--other", action="store_true", help="Show Other inbox only")
     # Search parameters
@@ -1858,6 +2072,8 @@ def main():
     find_parser.add_argument("--to", dest="to_recipient", help="Search by recipient name or email")
     find_parser.add_argument("--subject", help="Search by subject text")
     find_parser.add_argument("--body", help="Search by body text")
+    find_parser.add_argument("--since", help="Filter messages received after this timestamp (required format with timezone: '2026-03-26T04:00:00Z' or '2026-03-26T12:00:00+08:00')")
+    find_parser.add_argument("--before", help="Filter messages received before this timestamp (required format with timezone: '2026-03-26T04:00:00Z' or '2026-03-26T12:00:00+08:00')")
     
     # Get command
     get_parser = subparsers.add_parser("get", help="Get a message")
@@ -1869,9 +2085,9 @@ def main():
     
     # Send command (supports batching automatically)
     send_parser = subparsers.add_parser("send", help="Send an email (auto-batch for large recipient lists)")
-    send_parser.add_argument("--to", help="To recipients (comma-separated)")
-    send_parser.add_argument("--cc", help="CC recipients (comma-separated)")
-    send_parser.add_argument("--bcc", help="BCC recipients (comma-separated)")
+    send_parser.add_argument("--to", action="append", help="To recipients (comma-separated or use multiple --to)")
+    send_parser.add_argument("--cc", action="append", help="CC recipients (comma-separated or use multiple --cc)")
+    send_parser.add_argument("--bcc", action="append", help="BCC recipients (comma-separated or use multiple --bcc)")
     send_parser.add_argument("--csv", dest="csv_path", help="CSV file containing BCC email addresses")
     send_parser.add_argument("--email-column", help="Column name in CSV for emails (auto-detected if not specified)")
     send_parser.add_argument("--subject", required=True, help="Email subject")
@@ -1879,10 +2095,13 @@ def main():
     send_parser.add_argument("--body-type", choices=["html", "text"], default="html")
     
     # Reply command (supports batching automatically)
+    # Default behavior: reply to all recipients (sender + original To/CC)
+    # Use --sender-only to reply only to the original sender
     reply_parser = subparsers.add_parser("reply", help="Reply to an email (auto-batch for large recipient lists)")
     reply_parser.add_argument("message_id", help="Message ID to reply to")
     reply_parser.add_argument("--body", required=True, help="Reply body")
-    reply_parser.add_argument("--all", dest="reply_all", action="store_true", help="Reply to all")
+    reply_parser.add_argument("--sender-only", dest="reply_all", action="store_false", 
+                              help="Reply only to sender (default: reply to all)")
     reply_parser.add_argument("--to", help="Additional To recipients (comma-separated)")
     reply_parser.add_argument("--cc", help="Additional CC recipients (comma-separated)")
     reply_parser.add_argument("--bcc", help="BCC recipients (comma-separated)")
@@ -1922,6 +2141,13 @@ def main():
     
     args = parser.parse_args()
     
+    # Pre-process body/comment arguments: convert escape sequences like \n to actual newlines
+    # This allows using \n in any shell (PowerShell, bash, cmd) for line breaks
+    if hasattr(args, 'body') and args.body:
+        args.body = unescape_body(args.body)
+    if hasattr(args, 'comment') and args.comment:
+        args.comment = unescape_body(args.comment)
+    
     # Auto-convert Outlook search syntax (e.g., "from:beng" -> --from "beng")
     syntax_warnings = convert_outlook_syntax_args(args)
     for warning in syntax_warnings:
@@ -1941,7 +2167,10 @@ def main():
             elif args.other:
                 inference_classification = "other"
             
-            messages = list_messages(
+            # Check if --detail flag is set
+            show_detail = getattr(args, 'detail', False)
+            
+            messages, time_info = list_messages(
                 folder=args.folder,
                 limit=args.limit,
                 filter_query=filter_query,
@@ -1950,12 +2179,50 @@ def main():
                 from_sender=getattr(args, 'from_sender', None),
                 to_recipient=getattr(args, 'to_recipient', None),
                 subject=getattr(args, 'subject', None),
-                body=getattr(args, 'body', None)
+                body=getattr(args, 'body', None),
+                since=getattr(args, 'since', None),
+                before=getattr(args, 'before', None)
             )
+            
+            # If --detail flag is set, fetch full message content for each result
+            if show_detail and messages:
+                detailed_messages = []
+                for msg in messages:
+                    full_msg = get_message(msg['id'])
+                    detailed_messages.append(full_msg)
+                messages = detailed_messages
+            
             if args.json:
-                print(json.dumps({"success": True, "messages": messages, "total": len(messages)}, indent=2, default=str))
+                result = {"success": True, "messages": messages, "total": len(messages)}
+                if time_info:
+                    if time_info.get('since'):
+                        result["since_info"] = {
+                            **time_info['since'],
+                            "_description": f"Emails received after {time_info['since']['original']}"
+                        }
+                    if time_info.get('before'):
+                        result["before_info"] = {
+                            **time_info['before'],
+                            "_description": f"Emails received before {time_info['before']['original']}"
+                        }
+                print(json.dumps(result, indent=2, default=str))
             else:
-                display_message_list(messages, show_preview=True)
+                # Display time info
+                display_tz = None
+                if time_info:
+                    # Use since timezone for display if available, otherwise before
+                    if time_info.get('since'):
+                        display_tz = time_info['since'].get('timezone_offset')
+                        print(f"\n📅 Since: {time_info['since']['original']}")
+                        print(f"   UTC: {time_info['since']['converted_utc']}")
+                    if time_info.get('before'):
+                        if not display_tz:
+                            display_tz = time_info['before'].get('timezone_offset')
+                        print(f"\n📅 Before: {time_info['before']['original']}")
+                        print(f"   UTC: {time_info['before']['converted_utc']}")
+                    if display_tz and display_tz != "UTC":
+                        print(f"   Display Timezone: {display_tz}")
+                display_message_list(messages, show_preview=True, show_detail=show_detail, display_timezone=display_tz)
         
         elif args.command == "get":
             message = get_message(args.message_id)
@@ -1972,12 +2239,28 @@ def main():
                 display_thread(messages)
         
         elif args.command == "send":
+            # Handle multiple --to/--cc/--bcc arguments (action="append" creates a list)
+            to_list = []
+            if args.to:
+                for to_arg in args.to:
+                    to_list.extend(parse_email_list(to_arg))
+            
+            cc_list = []
+            if args.cc:
+                for cc_arg in args.cc:
+                    cc_list.extend(parse_email_list(cc_arg))
+            
+            bcc_list = []
+            if args.bcc:
+                for bcc_arg in args.bcc:
+                    bcc_list.extend(parse_email_list(bcc_arg))
+            
             result = batch_send_email(
-                to=parse_email_list(args.to) if args.to else None,
+                to=to_list if to_list else None,
                 subject=args.subject,
                 body=args.body,
-                cc=parse_email_list(args.cc) if args.cc else None,
-                bcc=parse_email_list(args.bcc) if args.bcc else None,
+                cc=cc_list if cc_list else None,
+                bcc=bcc_list if bcc_list else None,
                 csv_path=getattr(args, 'csv_path', None),
                 email_column=getattr(args, 'email_column', None),
                 body_type=args.body_type
@@ -2001,13 +2284,17 @@ def main():
                 print("✓ Email sent successfully")
         
         elif args.command == "reply":
-            # If --all or no extra recipients, use standard reply
+            # Determine which function to use:
+            # - Standard reply_email: when replying to original sender only (no extra recipients)
+            # - batch_reply_email: when adding custom recipients via --to/--cc/--bcc/--csv
             has_extra_recipients = args.to or args.cc or args.bcc or getattr(args, 'csv_path', None)
-            if args.reply_all and not has_extra_recipients:
+            
+            if not has_extra_recipients:
+                # Standard reply: use reply_email which auto-extracts sender from original message
                 reply_email(
                     message_id=args.message_id,
                     body=args.body,
-                    reply_all=True,
+                    reply_all=args.reply_all,
                     importance=getattr(args, 'importance', None)
                 )
                 if args.json:
