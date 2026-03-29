@@ -2216,7 +2216,8 @@ def display_message_list(messages: List[Dict], show_preview: bool = True, show_d
                 dt = datetime.fromisoformat(received.replace('Z', '+00:00'))
                 if display_tz:
                     dt = dt.astimezone(display_tz)
-                received = dt.strftime('%Y-%m-%d %H:%M %Z').strip()
+                # Simple clean format without timezone suffix
+                received = dt.strftime('%Y-%m-%d %H:%M')
 
             from_addr = msg.get('from', {}).get('emailAddress', {})
             sender = from_addr.get('name', from_addr.get('address', 'Unknown'))
@@ -2227,7 +2228,7 @@ def display_message_list(messages: List[Dict], show_preview: bool = True, show_d
 
             print(f"\n{i}. {read_status}{subject}")
             print(f"   From: {sender}")
-            print(f"   Date: {received}")
+            print(f"   Received: {received}")
             print(f"   ID: {message_id}")
             
             # Show To recipients
@@ -2293,7 +2294,8 @@ def display_message_list(messages: List[Dict], show_preview: bool = True, show_d
                 dt = datetime.fromisoformat(received.replace('Z', '+00:00'))
                 if display_tz:
                     dt = dt.astimezone(display_tz)
-                received = dt.strftime('%Y-%m-%d %H:%M %Z').strip()
+                # Simple clean format without timezone suffix
+                received = dt.strftime('%Y-%m-%d %H:%M')
 
             from_addr = msg.get('from', {}).get('emailAddress', {})
             sender = from_addr.get('name', from_addr.get('address', 'Unknown'))
@@ -2316,7 +2318,9 @@ def display_message_list(messages: List[Dict], show_preview: bool = True, show_d
                 dt = datetime.fromisoformat(received.replace('Z', '+00:00'))
                 if display_tz:
                     dt = dt.astimezone(display_tz)
-                received = dt.strftime('%Y-%m-%d %H:%M %Z').strip()
+                # Simple clean format without timezone suffix
+                # Timezone is already shown at the top, no need to repeat
+                received = dt.strftime('%Y-%m-%d %H:%M')
 
             from_addr = msg.get('from', {}).get('emailAddress', {})
             sender = from_addr.get('name', from_addr.get('address', 'Unknown'))
@@ -2327,7 +2331,7 @@ def display_message_list(messages: List[Dict], show_preview: bool = True, show_d
 
             print(f"\n{i}. {read_status}{subject}")
             print(f"   From: {sender}")
-            print(f"   Date: {received}")
+            print(f"   Received: {received}")
             print(f"   ID: {message_id}")
             
             # Show response status and meeting time for meeting invites
@@ -2775,15 +2779,53 @@ def main():
                 if display_tz:
                     print(f"   Display Timezone: {display_tz}")
                 
-                # Display time info
+                # Display time info in user-friendly format
                 if time_info:
-                    # Use since timezone for display if available, otherwise before
                     if time_info.get('since'):
-                        print(f"\n📅 Since: {time_info['since']['original']}")
-                        print(f"   UTC: {time_info['since']['converted_utc']}")
+                        # Parse and format the since timestamp in a clean way
+                        since_original = time_info['since']['original']
+                        try:
+                            # Parse the timestamp
+                            since_dt = datetime.fromisoformat(since_original.replace('Z', '+00:00'))
+                            # Convert to display timezone if available
+                            if display_tz:
+                                try:
+                                    if isinstance(display_tz, str):
+                                        display_tz_obj = ZoneInfo(display_tz)
+                                    else:
+                                        display_tz_obj = display_tz
+                                    since_dt = since_dt.astimezone(display_tz_obj)
+                                except:
+                                    pass
+                            # Format cleanly without timezone suffix
+                            since_formatted = since_dt.strftime('%Y-%m-%d %H:%M')
+                            print(f"\n📅 Since: {since_formatted}")
+                        except:
+                            # Fallback to original if parsing fails
+                            print(f"\n📅 Since: {since_original}")
+                    
                     if time_info.get('before'):
-                        print(f"\n📅 Before: {time_info['before']['original']}")
-                        print(f"   UTC: {time_info['before']['converted_utc']}")
+                        # Parse and format the before timestamp in a clean way
+                        before_original = time_info['before']['original']
+                        try:
+                            # Parse the timestamp
+                            before_dt = datetime.fromisoformat(before_original.replace('Z', '+00:00'))
+                            # Convert to display timezone if available
+                            if display_tz:
+                                try:
+                                    if isinstance(display_tz, str):
+                                        display_tz_obj = ZoneInfo(display_tz)
+                                    else:
+                                        display_tz_obj = display_tz
+                                    before_dt = before_dt.astimezone(display_tz_obj)
+                                except:
+                                    pass
+                            # Format cleanly without timezone suffix
+                            before_formatted = before_dt.strftime('%Y-%m-%d %H:%M')
+                            print(f"\n📅 Before: {before_formatted}")
+                        except:
+                            # Fallback to original if parsing fails
+                            print(f"\n📅 Before: {before_original}")
                     
                 display_message_list(messages, show_preview=True, show_detail=show_detail, display_timezone=display_tz, message_type=message_type)
         
