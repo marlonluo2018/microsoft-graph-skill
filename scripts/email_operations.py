@@ -16,6 +16,7 @@ Usage:
 
 import os
 import sys
+import io
 import json
 import argparse
 import csv
@@ -25,7 +26,12 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-# Fix Windows console encoding
+# Force UTF-8 encoding for stdout to handle emojis on Windows
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+# Fix Windows console encoding (alternative method)
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
@@ -40,9 +46,9 @@ from config import (
 )
 from auth import get_access_token
 
-# NOTE: Time filtering is supported via --since argument.
-# Pass a UTC timestamp (e.g., "2026-03-26T04:00:00Z") to filter messages received after that time.
-# Timezone offset is also accepted (e.g., "2026-03-26T12:00:00+08:00") and will be converted to UTC.
+# NOTE: Time filtering is supported via --start/--end arguments.
+# Timestamp MUST include timezone (e.g., "2026-03-26T12:00:00+08:00" or "2026-03-26T04:00:00Z").
+# Special value "now" can be used for current time.
 # If not specified, all messages are returned (subject to --limit).
 
 # Try to import requests
@@ -272,10 +278,11 @@ def list_messages(
     subject: str = None,
     body: str = None,
     token: str = None,
-    since: str = None,
-    before: str = None,
+    display_timezone: str = None,
+    start: str = None,
+    end: str = None,
     message_type: str = "all"
-) -> List[Dict[str, Any]]:
+) -> tuple:
     """
     List/search messages from a folder with optional search criteria.
     
@@ -291,12 +298,13 @@ def list_messages(
         subject: Search by subject text
         body: Search by body text
         token: Access token (will obtain if not provided)
-        since: ISO 8601 timestamp to filter messages received AFTER this time (requires timezone)
-        before: ISO 8601 timestamp to filter messages received BEFORE this time (requires timezone)
+        start: ISO 8601 timestamp to filter messages received AFTER this time (requires timezone, or "now")
+        end: ISO 8601 timestamp to filter messages received BEFORE this time (requires timezone, or "now")
         message_type: Filter by message type - "all" (default), "emails", or "events"
+        display_timezone: Timezone for display and "now" calculation (default: Asia/Shanghai)
     
     Returns:
-        List of message objects
+        Tuple of (list of message objects, time_info dict)
     """
     if token is None:
         token = get_access_token()
@@ -365,14 +373,22 @@ def list_messages(
         "$select": select_fields
     }
     
-    # Add $expand for event messages to get response status and meeting time
-    # Only expand when we might show events (message_type is "all" or "events")
+    # Add $expand for attachments and event messages
+    expand_clauses = []
+    
+    # Always expand attachments to show file names
+    expand_clauses.append("attachments($select=name,contentType,size,isInline)")
+    
+    # Add event expansion when we might show events (message_type is "all" or "events")
     if message_type in ["all", "events"]:
-        params["$expand"] = "microsoft.graph.eventMessage/event($select=responseStatus,start,end,location)"
+        expand_clauses.append("microsoft.graph.eventMessage/event($select=responseStatus,start,end,location)")
+    
+    if expand_clauses:
+        params["$expand"] = ",".join(expand_clauses)
     
     # If search criteria provided, use $search
-    # Track if since is handled in $search (KQL syntax) to avoid duplicate filtering
-    since_in_search = False
+    # Track if start is handled in $search (KQL syntax) to avoid duplicate filtering
+    start_in_search = False
     
     if has_search_criteria:
         search_keywords = []
@@ -385,23 +401,33 @@ def list_messages(
         if body:
             search_keywords.append(body)
         
-        # KQL: Add since to $search whenever $search is used
+        # KQL: Add start to $search whenever $search is used
         # This avoids $search + $filter conflict (Graph API doesn't allow both)
         # NOTE: KQL only supports date format (YYYY-MM-DD), but we still require timezone for validation
-        if since:
+        if start:
+            # Handle "now" special case - convert to actual timestamp first
+            start_for_validation = start
+            if start.lower() == "now":
+                tz = ZoneInfo(display_timezone or "Asia/Shanghai")
+                start_for_validation = datetime.now(tz).strftime('%Y-%m-%dT%H:%M:%S%z')
+                # Format offset as +08:00
+                offset = start_for_validation[-5:]
+                start_for_validation = start_for_validation[:-2] + ':' + start_for_validation[-2:]
+            
             # Validate timezone first (strict requirement)
-            if not (since.endswith('Z') or '+' in since or (since.count('-') > 2 and '-' in since[-6:])):
+            if not (start_for_validation.endswith('Z') or '+' in start_for_validation or (start_for_validation.count('-') > 2 and '-' in start_for_validation[-6:])):
                 raise ValueError(
-                    f"TIMEZONE_REQUIRED: '{since}' is missing timezone information.\n"
-                    f"--since requires explicit timezone for unambiguous time handling.\n"
+                    f"TIMEZONE_REQUIRED: '{start}' is missing timezone information.\n"
+                    f"--start requires explicit timezone for unambiguous time handling.\n"
                     f"Valid formats:\n"
                     f"  - UTC time: '2026-03-26T04:00:00Z'\n"
-                    f"  - With timezone offset: '2026-03-26T12:00:00+08:00'"
+                    f"  - With timezone offset: '2026-03-26T12:00:00+08:00'\n"
+                    f"  - Current time: 'now'"
                 )
-            # Convert since to KQL date format (YYYY-MM-DD) - only date is supported by KQL
-            since_date = since.split('T')[0] if 'T' in since else since
-            search_keywords.append(f"received>={since_date}")
-            since_in_search = True  # Mark as handled
+            # Convert start to KQL date format (YYYY-MM-DD) - only date is supported by KQL
+            start_date = start_for_validation.split('T')[0] if 'T' in start_for_validation else start_for_validation
+            search_keywords.append(f"received>={start_date}")
+            start_in_search = True  # Mark as handled
         
         search_query = " ".join(search_keywords)
         params["$search"] = f'"{search_query}"'
@@ -420,89 +446,93 @@ def list_messages(
         if classification in ["focused", "other"]:
             filters.append(f"inferenceClassification eq '{classification}'")
     
-    # Add time filter for incremental sync (messages received after --since timestamp)
-    # STRICT UTC-ONLY design:
+    # Add time filter for incremental sync (messages received within --start/--end range)
+    # STRICT TIMEZONE-REQUIRED design:
     #   - UTC time (e.g., "2026-03-26T00:00:00Z") → ACCEPTED → use directly
     #   - With timezone offset (e.g., "2026-03-26T08:00:00+08:00") → ACCEPTED → convert to UTC
+    #   - "now" → ACCEPTED → use current time with timezone from display_timezone param
     #   - Pure date (e.g., "2026-03-26") → REJECTED (ambiguous)
     #   - Time WITHOUT timezone (e.g., "2026-03-26T15:00:00") → REJECTED (ambiguous)
-    # NOTE: If since is already in $search (KQL), skip $filter to avoid conflict
-    since_info = None  # Track timezone conversion info for display
-    before_info = None  # Track before timezone conversion info
+    # NOTE: If start is already in $search (KQL), skip $filter to avoid conflict
+    start_info = None  # Track timezone conversion info for display
+    end_info = None  # Track end timezone conversion info
     
-    def convert_timestamp_to_utc(timestamp: str, param_name: str) -> tuple:
+    def convert_timestamp_to_utc(timestamp: str, param_name: str, display_timezone: str = None) -> tuple:
         """
         Convert timestamp to UTC. Returns (utc_timestamp, timezone_offset, error).
-        timezone_offset is for display purposes (e.g., "+08:00" or "UTC").
+        
+        Args:
+            timestamp: Plain datetime string (no timezone) or "now"
+            param_name: Parameter name for error messages
+            display_timezone: REQUIRED - timezone for parsing and display
         """
         if not timestamp:
             return None, None, None
         
-        utc_time = timestamp  # Default: assume already UTC
-        detected_tz = None
-        tz_offset = None
+        # display_timezone is always required
+        if not display_timezone:
+            return None, None, (
+                f"TIMEZONE_REQUIRED: --timezone is required.\n"
+                f"Example: --{param_name} '2026-03-26T12:00:00' --timezone 'Asia/Shanghai'"
+            )
+        
+        # Calculate display offset from display_timezone
+        tz = ZoneInfo(display_timezone)
+        sample_dt = datetime.now(tz)
+        offset = sample_dt.strftime('%z')
+        tz_offset = f"{offset[:3]}:{offset[3:]}"  # Format as +08:00
+        
+        # Handle "now" special value
+        if timestamp.lower() == "now":
+            now_dt = datetime.now(tz)
+            utc_time = now_dt.astimezone(ZoneInfo('UTC')).strftime('%Y-%m-%dT%H:%M:%SZ')
+            return utc_time, tz_offset, None
+        
+        # Reject embedded timezone (Z or +08:00)
+        if timestamp.endswith('Z') or '+' in timestamp or (timestamp.count('-') > 2):
+            return None, None, (
+                f"INVALID_FORMAT: '{timestamp}' contains embedded timezone.\n"
+                f"Use plain datetime with --timezone instead:\n"
+                f"  --{param_name} '2026-03-26T12:00:00' --timezone 'Asia/Shanghai'"
+            )
         
         try:
-            if timestamp.endswith('Z'):
-                # Already UTC - ACCEPTED
-                detected_tz = "UTC"
-                tz_offset = "UTC"
-                utc_time = timestamp
-            elif '+' in timestamp or (timestamp.count('-') > 2 and '-' in timestamp[-6:]):
-                # Has timezone offset - ACCEPTED → convert to UTC
-                local_dt = datetime.fromisoformat(timestamp)
-                detected_tz = str(local_dt.tzinfo)
-                # Extract offset string for display (e.g., "+08:00")
-                if '+' in timestamp:
-                    tz_offset = '+' + timestamp.split('+')[-1]
-                else:
-                    # Format: 2026-03-26T12:00:00-05:00 (negative offset)
-                    parts = timestamp.split('-')
-                    if len(parts) >= 3:  # Has date AND time AND offset
-                        tz_offset = '-' + parts[-1]
-                utc_time = local_dt.astimezone(ZoneInfo('UTC')).strftime('%Y-%m-%dT%H:%M:%SZ')
-            else:
-                # Pure date OR time WITHOUT timezone - REJECTED (ambiguous)
-                return None, None, (
-                    f"TIMEZONE_REQUIRED: '{timestamp}' is missing timezone information.\n"
-                    f"--{param_name} requires explicit timezone for unambiguous time handling.\n"
-                    f"Valid formats:\n"
-                    f"  - UTC time: '2026-03-26T04:00:00Z'\n"
-                    f"  - With timezone offset: '2026-03-26T12:00:00+08:00'\n"
-                    f"Example: --{param_name} '2026-03-26T04:00:00Z'"
-                )
-            
+            # Parse plain datetime and add timezone
+            local_dt = datetime.fromisoformat(timestamp)
+            local_dt = local_dt.replace(tzinfo=tz)
+            utc_time = local_dt.astimezone(ZoneInfo('UTC')).strftime('%Y-%m-%dT%H:%M:%SZ')
             return utc_time, tz_offset, None
+                
         except (ValueError, TypeError) as e:
             return None, None, f"Invalid timestamp format: {timestamp} - {str(e)}"
     
-    # Process --since parameter
-    if since and not since_in_search:
-        since_utc, tz_offset, error = convert_timestamp_to_utc(since, 'since')
+    # Process --start parameter
+    if start and not start_in_search:
+        start_utc, tz_offset, error = convert_timestamp_to_utc(start, 'start', display_timezone)
         if error:
             raise ValueError(error)
         
-        since_info = {
-            'original': since,
-            'converted_utc': since_utc,
+        start_info = {
+            'original': start,
+            'converted_utc': start_utc,
             'timezone': tz_offset,
             'timezone_offset': tz_offset
         }
-        filters.append(f"receivedDateTime gt {since_utc}")
+        filters.append(f"receivedDateTime gt {start_utc}")
     
-    # Process --before parameter
-    if before:
-        before_utc, tz_offset, error = convert_timestamp_to_utc(before, 'before')
+    # Process --end parameter
+    if end:
+        end_utc, tz_offset, error = convert_timestamp_to_utc(end, 'end', display_timezone)
         if error:
             raise ValueError(error)
         
-        before_info = {
-            'original': before,
-            'converted_utc': before_utc,
+        end_info = {
+            'original': end,
+            'converted_utc': end_utc,
             'timezone': tz_offset,
             'timezone_offset': tz_offset
         }
-        filters.append(f"receivedDateTime lt {before_utc}")
+        filters.append(f"receivedDateTime lt {end_utc}")
     
     if filters:
         params["$filter"] = " and ".join(filters)
@@ -527,10 +557,10 @@ def list_messages(
     
     # Build time info for display
     time_info = None
-    if since_info or before_info:
+    if start_info or end_info:
         time_info = {
-            'since': since_info,
-            'before': before_info
+            'start': start_info,
+            'end': end_info
         }
     
     return messages, time_info
@@ -558,7 +588,12 @@ def get_message(message_id: str, token: str = None) -> Dict[str, Any]:
     
     url = f"{GRAPH_API_BASE}/me/messages/{message_id}"
     
-    response = api_request('get', url, token)
+    # Expand attachments to get full details including IDs
+    params = {
+        "$expand": "attachments($select=id,name,contentType,size,isInline)"
+    }
+    
+    response = api_request('get', url, token, params=params)
     
     return response.json()
 
@@ -2231,6 +2266,27 @@ def display_message_list(messages: List[Dict], show_preview: bool = True, show_d
             print(f"   Received: {received}")
             print(f"   ID: {message_id}")
             
+            # Show attachments
+            attachments = msg.get('attachments', [])
+            if attachments:
+                # Separate regular attachments from embedded images
+                regular_attachments = [att for att in attachments if not att.get('isInline', False)]
+                embedded_images = [att for att in attachments if att.get('isInline', False)]
+                
+                if regular_attachments:
+                    att_names = [att.get('name', 'Unknown') for att in regular_attachments]
+                    try:
+                        print(f"   📎 Attachments ({len(regular_attachments)}): {', '.join(att_names)}")
+                    except:
+                        print(f"   [Attachments] ({len(regular_attachments)}): {', '.join(att_names)}")
+                
+                if embedded_images:
+                    img_names = [att.get('name', 'Unknown') for att in embedded_images]
+                    try:
+                        print(f"   🖼️  Embedded images ({len(embedded_images)}): {', '.join(img_names)}")
+                    except:
+                        print(f"   [Embedded Images] ({len(embedded_images)}): {', '.join(img_names)}")
+            
             # Show To recipients
             to_recipients = msg.get('toRecipients', [])
             if to_recipients:
@@ -2284,9 +2340,9 @@ def display_message_list(messages: List[Dict], show_preview: bool = True, show_d
     
     if not show_preview:
         # Compact table format without preview
-        print(f"\n{'='*100}")
-        print(f"{'Date':<20} {'From':<25} {'Subject':<30} {'ID':<15}")
-        print(f"{'='*100}")
+        print(f"\n{'='*120}")
+        print(f"{'Date':<20} {'From':<25} {'Subject':<30} {'Attachments':<20} {'ID':<15}")
+        print(f"{'='*120}")
 
         for msg in messages:
             received = msg.get('receivedDateTime', '')
@@ -2303,10 +2359,23 @@ def display_message_list(messages: List[Dict], show_preview: bool = True, show_d
             subject = msg.get('subject', '(No Subject)')[:30]
             read_status = '' if msg.get('isRead', True) else '[UNREAD]'
             message_id = msg.get('id', '')[:15]
+            
+            # Format attachment info
+            attachments = msg.get('attachments', [])
+            att_info = ''
+            if attachments:
+                regular_attachments = [att for att in attachments if not att.get('isInline', False)]
+                embedded_images = [att for att in attachments if att.get('isInline', False)]
+                parts = []
+                if regular_attachments:
+                    parts.append(f"📎{len(regular_attachments)}")
+                if embedded_images:
+                    parts.append(f"🖼️{len(embedded_images)}")
+                att_info = ' '.join(parts)
 
-            print(f"{received:<20} {sender:<25} {subject}{read_status:<{30 - len(read_status)}} {message_id:<15}")
+            print(f"{received:<20} {sender:<25} {subject}{read_status:<{30 - len(read_status)}} {att_info:<20} {message_id:<15}")
 
-        print(f"{'='*100}")
+        print(f"{'='*120}")
         print(f"Total: {len(messages)} messages")
         print(f"💡 Tip: Use 'get <ID>' to view full email content")
     else:
@@ -2481,6 +2550,27 @@ def display_message_list(messages: List[Dict], show_preview: bool = True, show_d
                     preview += '...'
                 print(f"   Preview: {preview}")
             
+            # Show attachments
+            attachments = msg.get('attachments', [])
+            if attachments:
+                # Separate regular attachments from embedded images
+                regular_attachments = [att for att in attachments if not att.get('isInline', False)]
+                embedded_images = [att for att in attachments if att.get('isInline', False)]
+                
+                if regular_attachments:
+                    att_names = [att.get('name', 'Unknown') for att in regular_attachments]
+                    try:
+                        print(f"   📎 Attachments ({len(regular_attachments)}): {', '.join(att_names)}")
+                    except:
+                        print(f"   [Attachments] ({len(regular_attachments)}): {', '.join(att_names)}")
+                
+                if embedded_images:
+                    img_names = [att.get('name', 'Unknown') for att in embedded_images]
+                    try:
+                        print(f"   🖼️  Embedded images ({len(embedded_images)}): {', '.join(img_names)}")
+                    except:
+                        print(f"   [Embedded Images] ({len(embedded_images)}): {', '.join(img_names)}")
+            
             if i < len(messages):
                 print(f"   {'-'*78}")
         
@@ -2499,6 +2589,35 @@ def display_message(message: Dict):
     print(f"CC: {[r.get('emailAddress', {}) for r in message.get('ccRecipients', [])]}")
     print(f"Date: {message.get('receivedDateTime', '')}")
     print(f"ID: {message.get('id', '')}")
+    
+    # Show attachments
+    attachments = message.get('attachments', [])
+    if attachments:
+        regular_attachments = [att for att in attachments if not att.get('isInline', False)]
+        embedded_images = [att for att in attachments if att.get('isInline', False)]
+        
+        if regular_attachments:
+            print(f"📎 Attachments ({len(regular_attachments)}):")
+            for att in regular_attachments:
+                att_id = att.get('id', 'N/A')
+                name = att.get('name', 'Unknown')
+                size = att.get('size', 0)
+                size_kb = size / 1024 if size else 0
+                content_type = att.get('contentType', 'Unknown')
+                print(f"   - {name} ({size_kb:.1f} KB, {content_type})")
+                print(f"     ID: {att_id}")
+        
+        if embedded_images:
+            print(f"🖼️  Embedded Images ({len(embedded_images)}):")
+            for att in embedded_images:
+                att_id = att.get('id', 'N/A')
+                name = att.get('name', 'Unknown')
+                size = att.get('size', 0)
+                size_kb = size / 1024 if size else 0
+                content_type = att.get('contentType', 'Unknown')
+                print(f"   - {name} ({size_kb:.1f} KB, {content_type})")
+                print(f"     ID: {att_id}")
+    
     print(f"{'='*80}")
     
     # Get body content
@@ -2570,9 +2689,9 @@ def main():
     list_parser.add_argument("--to", dest="to_recipient", help="Search by recipient name or email")
     list_parser.add_argument("--subject", help="Search by subject text")
     list_parser.add_argument("--body", help="Search by body text")
-    list_parser.add_argument("--since", help="Filter messages received after this timestamp (required format with timezone: '2026-03-26T04:00:00Z' or '2026-03-26T12:00:00+08:00')")
-    list_parser.add_argument("--before", help="Filter messages received before this timestamp (required format with timezone: '2026-03-26T04:00:00Z' or '2026-03-26T12:00:00+08:00')")
-    list_parser.add_argument("--timezone", required=True, help="Display timezone (required, e.g., 'Asia/Shanghai', '+08:00', 'UTC')")
+    list_parser.add_argument("--start", help="Filter messages received after this timestamp (format: '2026-03-26T12:00:00+08:00', '2026-03-26T04:00:00Z', or 'now')")
+    list_parser.add_argument("--end", help="Filter messages received before this timestamp (format: '2026-03-26T12:00:00+08:00', '2026-03-26T04:00:00Z', or 'now')")
+    list_parser.add_argument("--timezone", required=True, help="Display timezone (e.g., 'Asia/Shanghai', 'UTC', '+08:00')")
     
     # Search command (complete alias for list, supports all parameters)
     search_parser = subparsers.add_parser("search", help="Search/list messages (alias for list)")
@@ -2592,9 +2711,9 @@ def main():
     search_parser.add_argument("--to", dest="to_recipient", help="Search by recipient name or email")
     search_parser.add_argument("--subject", help="Search by subject text")
     search_parser.add_argument("--body", help="Search by body text")
-    search_parser.add_argument("--since", help="Filter messages received after this timestamp (required format with timezone: '2026-03-26T04:00:00Z' or '2026-03-26T12:00:00+08:00')")
-    search_parser.add_argument("--before", help="Filter messages received before this timestamp (required format with timezone: '2026-03-26T04:00:00Z' or '2026-03-26T12:00:00+08:00')")
-    search_parser.add_argument("--timezone", required=True, help="Display timezone (required, e.g., 'Asia/Shanghai', '+08:00', 'UTC')")
+    search_parser.add_argument("--start", help="Filter messages received after this timestamp (format: '2026-03-26T12:00:00+08:00', '2026-03-26T04:00:00Z', or 'now')")
+    search_parser.add_argument("--end", help="Filter messages received before this timestamp (format: '2026-03-26T12:00:00+08:00', '2026-03-26T04:00:00Z', or 'now')")
+    search_parser.add_argument("--timezone", required=True, help="Display timezone (e.g., 'Asia/Shanghai', 'UTC', '+08:00')")
     
     # Find command (complete alias for list, supports all parameters)
     find_parser = subparsers.add_parser("find", help="Find/list messages (alias for list)")
@@ -2614,9 +2733,9 @@ def main():
     find_parser.add_argument("--to", dest="to_recipient", help="Search by recipient name or email")
     find_parser.add_argument("--subject", help="Search by subject text")
     find_parser.add_argument("--body", help="Search by body text")
-    find_parser.add_argument("--since", help="Filter messages received after this timestamp (required format with timezone: '2026-03-26T04:00:00Z' or '2026-03-26T12:00:00+08:00')")
-    find_parser.add_argument("--before", help="Filter messages received before this timestamp (required format with timezone: '2026-03-26T04:00:00Z' or '2026-03-26T12:00:00+08:00')")
-    find_parser.add_argument("--timezone", required=True, help="Display timezone (required, e.g., 'Asia/Shanghai', '+08:00', 'UTC')")
+    find_parser.add_argument("--start", help="Filter messages received after this timestamp (format: '2026-03-26T12:00:00+08:00', '2026-03-26T04:00:00Z', or 'now')")
+    find_parser.add_argument("--end", help="Filter messages received before this timestamp (format: '2026-03-26T12:00:00+08:00', '2026-03-26T04:00:00Z', or 'now')")
+    find_parser.add_argument("--timezone", required=True, help="Display timezone (e.g., 'Asia/Shanghai', 'UTC', '+08:00')")
     
     # Get command
     get_parser = subparsers.add_parser("get", help="Get a message")
@@ -2744,9 +2863,10 @@ def main():
                 to_recipient=getattr(args, 'to_recipient', None),
                 subject=getattr(args, 'subject', None),
                 body=getattr(args, 'body', None),
-                since=getattr(args, 'since', None),
-                before=getattr(args, 'before', None),
-                message_type=message_type
+                start=getattr(args, 'start', None),
+                end=getattr(args, 'end', None),
+                message_type=message_type,
+                display_timezone=args.timezone
             )
             
             # If --detail flag is set, fetch full message content for each result
@@ -2760,15 +2880,15 @@ def main():
             if args.json:
                 result = {"success": True, "messages": messages, "total": len(messages)}
                 if time_info:
-                    if time_info.get('since'):
-                        result["since_info"] = {
-                            **time_info['since'],
-                            "_description": f"Emails received after {time_info['since']['original']}"
+                    if time_info.get('start'):
+                        result["start_info"] = {
+                            **time_info['start'],
+                            "_description": f"Emails received after {time_info['start']['original']}"
                         }
-                    if time_info.get('before'):
-                        result["before_info"] = {
-                            **time_info['before'],
-                            "_description": f"Emails received before {time_info['before']['original']}"
+                    if time_info.get('end'):
+                        result["end_info"] = {
+                            **time_info['end'],
+                            "_description": f"Emails received before {time_info['end']['original']}"
                         }
                 print(json.dumps(result, indent=2, default=str))
             else:
@@ -2781,12 +2901,12 @@ def main():
                 
                 # Display time info in user-friendly format
                 if time_info:
-                    if time_info.get('since'):
-                        # Parse and format the since timestamp in a clean way
-                        since_original = time_info['since']['original']
+                    if time_info.get('start'):
+                        # Parse and format the start timestamp in a clean way
+                        start_original = time_info['start']['original']
                         try:
                             # Parse the timestamp
-                            since_dt = datetime.fromisoformat(since_original.replace('Z', '+00:00'))
+                            start_dt = datetime.fromisoformat(start_original.replace('Z', '+00:00'))
                             # Convert to display timezone if available
                             if display_tz:
                                 try:
@@ -2794,22 +2914,22 @@ def main():
                                         display_tz_obj = ZoneInfo(display_tz)
                                     else:
                                         display_tz_obj = display_tz
-                                    since_dt = since_dt.astimezone(display_tz_obj)
+                                    start_dt = start_dt.astimezone(display_tz_obj)
                                 except:
                                     pass
                             # Format cleanly without timezone suffix
-                            since_formatted = since_dt.strftime('%Y-%m-%d %H:%M')
-                            print(f"\n📅 Since: {since_formatted}")
+                            start_formatted = start_dt.strftime('%Y-%m-%d %H:%M')
+                            print(f"\n📅 Start: {start_formatted}")
                         except:
                             # Fallback to original if parsing fails
-                            print(f"\n📅 Since: {since_original}")
+                            print(f"\n📅 Start: {start_original}")
                     
-                    if time_info.get('before'):
-                        # Parse and format the before timestamp in a clean way
-                        before_original = time_info['before']['original']
+                    if time_info.get('end'):
+                        # Parse and format the end timestamp in a clean way
+                        end_original = time_info['end']['original']
                         try:
                             # Parse the timestamp
-                            before_dt = datetime.fromisoformat(before_original.replace('Z', '+00:00'))
+                            end_dt = datetime.fromisoformat(end_original.replace('Z', '+00:00'))
                             # Convert to display timezone if available
                             if display_tz:
                                 try:
@@ -2817,15 +2937,15 @@ def main():
                                         display_tz_obj = ZoneInfo(display_tz)
                                     else:
                                         display_tz_obj = display_tz
-                                    before_dt = before_dt.astimezone(display_tz_obj)
+                                    end_dt = end_dt.astimezone(display_tz_obj)
                                 except:
                                     pass
                             # Format cleanly without timezone suffix
-                            before_formatted = before_dt.strftime('%Y-%m-%d %H:%M')
-                            print(f"\n📅 Before: {before_formatted}")
+                            end_formatted = end_dt.strftime('%Y-%m-%d %H:%M')
+                            print(f"\n📅 End: {end_formatted}")
                         except:
                             # Fallback to original if parsing fails
-                            print(f"\n📅 Before: {before_original}")
+                            print(f"\n📅 End: {end_original}")
                     
                 display_message_list(messages, show_preview=True, show_detail=show_detail, display_timezone=display_tz, message_type=message_type)
         

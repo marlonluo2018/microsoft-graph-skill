@@ -52,9 +52,49 @@ def get_headers(token: str) -> Dict[str, str]:
     }
 
 
-def parse_datetime(dt_str: str) -> str:
-    """Parse datetime string to ISO 8601 format."""
-    # Try various formats
+def parse_datetime(dt_str: str, param_name: str = "datetime", display_timezone: str = None) -> tuple:
+    """
+    Parse datetime string with timezone.
+    
+    Args:
+        dt_str: Datetime string (plain datetime or "now")
+        param_name: Parameter name for error messages
+        display_timezone: REQUIRED - timezone for parsing and display
+    
+    Returns:
+        Tuple of (datetime_str, timezone_str, error)
+        - datetime_str: ISO format datetime without timezone (e.g., "2026-03-26T12:00:00")
+        - timezone_str: IANA timezone for API (e.g., "Asia/Shanghai" or "UTC")
+        - error: Error message if validation fails, None otherwise
+    """
+    from zoneinfo import ZoneInfo
+    
+    if not dt_str:
+        return None, None, None
+    
+    # display_timezone is always required
+    if not display_timezone:
+        return None, None, (
+            f"TIMEZONE_REQUIRED: --timezone is required.\n"
+            f"Example: --{param_name} '2026-03-26T12:00:00' --timezone 'Asia/Shanghai'"
+        )
+    
+    # Handle "now" special value
+    if dt_str.lower() == "now":
+        tz = ZoneInfo(display_timezone)
+        now_dt = datetime.now(tz)
+        datetime_str = now_dt.strftime("%Y-%m-%dT%H:%M:%S")
+        return datetime_str, display_timezone, None
+    
+    # Reject embedded timezone (Z or +08:00)
+    if dt_str.endswith('Z') or '+' in dt_str or (dt_str.count('-') > 2):
+        return None, None, (
+            f"INVALID_FORMAT: '{dt_str}' contains embedded timezone.\n"
+            f"Use plain datetime with --timezone instead:\n"
+            f"  --{param_name} '2026-03-26T12:00:00' --timezone 'Asia/Shanghai'"
+        )
+    
+    # Parse plain datetime (no timezone)
     formats = [
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d %H:%M:%S",
@@ -69,12 +109,28 @@ def parse_datetime(dt_str: str) -> str:
             # Add seconds if not present
             if fmt == "%Y-%m-%d":
                 dt = dt.replace(hour=0, minute=0, second=0)
-            return dt.strftime("%Y-%m-%dT%H:%M:%S")
+            datetime_str = dt.strftime("%Y-%m-%dT%H:%M:%S")
+            return datetime_str, display_timezone, None
         except ValueError:
             continue
     
-    # If already in ISO format, return as is
-    return dt_str
+    return None, None, (
+        f"INVALID_FORMAT: '{dt_str}' is not a valid datetime.\n"
+        f"Expected format: '2026-03-26T12:00:00' or '2026-03-26'"
+    )
+
+
+def parse_datetime_or_raise(dt_str: str, param_name: str = "datetime", display_timezone: str = None) -> tuple:
+    """
+    Parse datetime string and raise error if validation fails.
+    
+    Returns:
+        Tuple of (datetime_str, timezone_str)
+    """
+    dt, tz, error = parse_datetime(dt_str, param_name, display_timezone)
+    if error:
+        raise ValueError(error)
+    return dt, tz
 
 
 def parse_email_list(emails: str) -> List[str]:
@@ -91,6 +147,7 @@ def parse_email_list(emails: str) -> List[str]:
 
 def list_events(
     calendar_id: str = None,
+    display_timezone: str = None,
     start: str = None,
     end: str = None,
     limit: int = 25,
@@ -102,11 +159,12 @@ def list_events(
     
     Args:
         calendar_id: Specific calendar ID (uses default if not provided)
-        start: Start datetime (ISO 8601)
-        end: End datetime (ISO 8601)
+        start: Start datetime (must include timezone, or "now")
+        end: End datetime (must include timezone, or "now")
         limit: Maximum number of events to return
         filter_query: OData filter query
         token: Access token
+        display_timezone: Timezone for "now" calculation and display
     
     Returns:
         List of event objects
@@ -129,8 +187,22 @@ def list_events(
     filter_parts = []
     
     if start or end:
-        start_iso = parse_datetime(start) if start else datetime.now().isoformat()
-        end_iso = parse_datetime(end) if end else (datetime.now() + timedelta(days=30)).isoformat()
+        if start:
+            start_iso, start_tz = parse_datetime_or_raise(start, 'start', display_timezone)
+        else:
+            # Default to now
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(display_timezone)
+            start_iso = datetime.now(tz).strftime("%Y-%m-%dT%H:%M:%S")
+        
+        if end:
+            end_iso, end_tz = parse_datetime_or_raise(end, 'end', display_timezone)
+        else:
+            # Default to 30 days from now
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(display_timezone)
+            end_iso = (datetime.now(tz) + timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%S")
+        
         filter_parts.append(f"start/dateTime ge '{start_iso}'")
         filter_parts.append(f"end/dateTime le '{end_iso}'")
     
@@ -185,7 +257,7 @@ def create_event(
     subject: str,
     start: str,
     end: str,
-    timezone: str = "UTC",
+    display_timezone: str,
     body: str = None,
     body_type: str = "html",
     location: str = None,
@@ -200,9 +272,9 @@ def create_event(
     
     Args:
         subject: Event subject
-        start: Start datetime
-        end: End datetime
-        timezone: Timezone (default UTC)
+        start: Start datetime (must include timezone, or "now")
+        end: End datetime (must include timezone, or "now")
+        timezone: (DEPRECATED - extracted from start/end) Fallback timezone
         body: Event body/description
         body_type: "html" or "text"
         location: Location string
@@ -211,6 +283,7 @@ def create_event(
         recurrence: Recurrence pattern dict
         is_online_meeting: Whether to create as Teams meeting
         token: Access token
+        display_timezone: Timezone for "now" calculation
     
     Returns:
         Created event object
@@ -218,15 +291,22 @@ def create_event(
     if token is None:
         token = get_access_token()
     
+    # Parse start and end times, extracting timezone
+    start_dt, start_tz = parse_datetime_or_raise(start, 'start', display_timezone)
+    end_dt, end_tz = parse_datetime_or_raise(end, 'end', display_timezone)
+    
+    # Use extracted timezone (prefer start timezone)
+    event_tz = start_tz or "UTC"
+    
     event = {
         "subject": subject,
         "start": {
-            "dateTime": parse_datetime(start),
-            "timeZone": timezone
+            "dateTime": start_dt,
+            "timeZone": event_tz
         },
         "end": {
-            "dateTime": parse_datetime(end),
-            "timeZone": timezone
+            "dateTime": end_dt,
+            "timeZone": event_tz
         },
         "isAllDay": is_all_day
     }
@@ -275,10 +355,10 @@ def create_event(
 
 def update_event(
     event_id: str,
+    display_timezone: str,
     subject: str = None,
     start: str = None,
     end: str = None,
-    timezone: str = None,
     body: str = None,
     body_type: str = None,
     location: str = None,
@@ -290,6 +370,10 @@ def update_event(
     
     Args:
         event_id: Event ID to update
+        start: Start datetime (must include timezone, or "now")
+        end: End datetime (must include timezone, or "now")
+        timezone: (DEPRECATED - extracted from start/end) Fallback timezone
+        display_timezone: Timezone for "now" calculation
         Other args: Fields to update
     
     Returns:
@@ -304,15 +388,17 @@ def update_event(
         event["subject"] = subject
     
     if start:
+        start_dt, start_tz = parse_datetime_or_raise(start, 'start', display_timezone)
         event["start"] = {
-            "dateTime": parse_datetime(start),
-            "timeZone": timezone or "UTC"
+            "dateTime": start_dt,
+            "timeZone": start_tz or "UTC"
         }
     
     if end:
+        end_dt, end_tz = parse_datetime_or_raise(end, 'end', display_timezone)
         event["end"] = {
-            "dateTime": parse_datetime(end),
-            "timeZone": timezone or "UTC"
+            "dateTime": end_dt,
+            "timeZone": end_tz or "UTC"
         }
     
     if body is not None:
@@ -608,7 +694,7 @@ def propose_new_time(
     event_id: str,
     new_start: str,
     new_end: str,
-    timezone: str = "UTC",
+    display_timezone: str,
     comment: str = None,
     send_response: bool = True,
     token: str = None
@@ -618,12 +704,13 @@ def propose_new_time(
     
     Args:
         event_id: Event ID
-        new_start: Proposed new start datetime
-        new_end: Proposed new end datetime
-        timezone: Timezone (default UTC)
+        new_start: Proposed new start datetime (must include timezone, or "now")
+        new_end: Proposed new end datetime (must include timezone, or "now")
+        timezone: (DEPRECATED - extracted from new_start/new_end) Fallback timezone
         comment: Optional message to organizer
         send_response: Whether to send response to organizer (default True)
         token: Access token
+        display_timezone: Timezone for "now" calculation
     
     Returns:
         bool: True if successful
@@ -631,17 +718,21 @@ def propose_new_time(
     if token is None:
         token = get_access_token()
     
+    # Parse times and extract timezones
+    new_start_dt, new_start_tz = parse_datetime_or_raise(new_start, 'start', display_timezone)
+    new_end_dt, new_end_tz = parse_datetime_or_raise(new_end, 'end', display_timezone)
+    
     url = f"{GRAPH_API_BASE}/me/events/{event_id}/decline"
     
     payload = {
         "proposedNewTime": {
             "start": {
-                "dateTime": parse_datetime(new_start),
-                "timeZone": timezone
+                "dateTime": new_start_dt,
+                "timeZone": new_start_tz or "UTC"
             },
             "end": {
-                "dateTime": parse_datetime(new_end),
-                "timeZone": timezone
+                "dateTime": new_end_dt,
+                "timeZone": new_end_tz or "UTC"
             }
         }
     }
@@ -666,7 +757,7 @@ def get_availability(
     emails: List[str],
     start: str,
     end: str,
-    timezone: str = "UTC",
+    display_timezone: str,
     interval: int = 30,
     token: str = None
 ) -> Dict[str, Any]:
@@ -675,11 +766,12 @@ def get_availability(
     
     Args:
         emails: List of email addresses to check
-        start: Start datetime (ISO 8601)
-        end: End datetime (ISO 8601)
-        timezone: Timezone
+        start: Start datetime (must include timezone, or "now")
+        end: End datetime (must include timezone, or "now")
+        timezone: (DEPRECATED - extracted from start/end) Fallback timezone
         interval: Meeting time slot interval in minutes
         token: Access token
+        display_timezone: Timezone for "now" calculation
     
     Returns:
         Availability information for each user
@@ -687,17 +779,24 @@ def get_availability(
     if token is None:
         token = get_access_token()
     
+    # Parse times and extract timezones
+    start_dt, start_tz = parse_datetime_or_raise(start, 'start', display_timezone)
+    end_dt, end_tz = parse_datetime_or_raise(end, 'end', display_timezone)
+    
+    # Use extracted timezone (prefer start timezone)
+    event_tz = start_tz or "UTC"
+    
     url = f"{GRAPH_API_BASE}/me/calendar/getSchedule"
     
     payload = {
         "schedules": emails,
         "startTime": {
-            "dateTime": parse_datetime(start),
-            "timeZone": timezone
+            "dateTime": start_dt,
+            "timeZone": event_tz
         },
         "endTime": {
-            "dateTime": parse_datetime(end),
-            "timeZone": timezone
+            "dateTime": end_dt,
+            "timeZone": event_tz
         },
         "availabilityViewInterval": interval
     }
@@ -729,9 +828,27 @@ def get_users_info(
     
     email_to_name = {}
     
+    # First, get current user's info
+    current_user_email = None
+    current_user_name = None
+    try:
+        url = f"{GRAPH_API_BASE}/me?$select=displayName,mail,userPrincipalName"
+        response = requests.get(url, headers=get_headers(token))
+        if response.status_code == 200:
+            data = response.json()
+            current_user_email = data.get('mail') or data.get('userPrincipalName')
+            current_user_name = data.get('displayName')
+    except Exception as e:
+        pass
+    
     for email in emails:
+        # Check if this is the current user
+        if current_user_email and email.lower() == current_user_email.lower() and current_user_name:
+            email_to_name[email] = current_user_name
+            continue
+        
         try:
-            # Use $filter to find user by email
+            # Try to get user info from directory
             url = f"{GRAPH_API_BASE}/users/{email}?$select=displayName,mail"
             response = requests.get(url, headers=get_headers(token))
             
@@ -800,10 +917,10 @@ def get_user_working_hours(
 
 def suggest_meeting_times(
     attendees: List[str],
+    display_timezone: str,
     duration_minutes: int = 60,
     start: str = None,
     end: str = None,
-    timezone: str = "UTC",
     top_n: int = 5,
     interval: int = 30,
     token: str = None
@@ -816,12 +933,13 @@ def suggest_meeting_times(
     Args:
         attendees: List of attendee email addresses
         duration_minutes: Required meeting duration (default 60)
-        start: Search start datetime (default: now)
-        end: Search end datetime (default: 7 days from now)
-        timezone: Timezone for results (default UTC)
+        start: Search start datetime (must include timezone, or "now", default: now)
+        end: Search end datetime (must include timezone, or "now", default: 7 days from now)
+        timezone: (DEPRECATED - extracted from start/end) Fallback timezone
         top_n: Number of top slots to return (default 5)
         interval: Time slot interval in minutes (default 30)
         token: Access token
+        display_timezone: Timezone for "now" calculation and display
     
     Returns:
         Dict with top_time_slots ranked by score, plus detailed availability info
@@ -829,26 +947,43 @@ def suggest_meeting_times(
     if token is None:
         token = get_access_token()
     
-    # Default to next 7 days if not specified
-    if start is None:
-        start = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    if end is None:
-        end = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
+    from zoneinfo import ZoneInfo
     
-    # Parse start datetime to get reference point
-    start_dt = datetime.fromisoformat(start.replace("Z", "+00:00").replace("+00:00", ""))
+    # Handle defaults using "now" semantic
+    if start is None:
+        start = "now"
+    if end is None:
+        # Default to 7 days from now
+        tz = ZoneInfo(display_timezone)
+        end_dt = datetime.now(tz) + timedelta(days=7)
+        offset = end_dt.strftime('%z')
+        end = end_dt.strftime("%Y-%m-%dT%H:%M:%S") + f"{offset[:3]}:{offset[3:]}"
+    
+    # Parse times and extract timezones
+    start_str, start_tz = parse_datetime_or_raise(start, 'start', display_timezone)
+    end_str, end_tz = parse_datetime_or_raise(end, 'end', display_timezone)
+    
+    # Use extracted timezone (prefer start timezone)
+    event_tz = start_tz or "UTC"
+    
+    # Create datetime objects for time calculations
+    tz_obj = ZoneInfo(event_tz) if event_tz != "UTC" else ZoneInfo("UTC")
+    start_dt = datetime.fromisoformat(start_str)
+    start_dt = start_dt.replace(tzinfo=tz_obj)
+    end_dt = datetime.fromisoformat(end_str)
+    end_dt = end_dt.replace(tzinfo=tz_obj)
     
     url = f"{GRAPH_API_BASE}/me/calendar/getschedule"
     
     payload = {
         "schedules": attendees,
         "startTime": {
-            "dateTime": parse_datetime(start),
-            "timeZone": timezone
+            "dateTime": start_str,
+            "timeZone": event_tz
         },
         "endTime": {
-            "dateTime": parse_datetime(end),
-            "timeZone": timezone
+            "dateTime": end_str,
+            "timeZone": event_tz
         },
         "availabilityViewInterval": interval
     }
@@ -896,7 +1031,7 @@ def suggest_meeting_times(
         return {
             "success": True,
             "search_range": {"start": start, "end": end},
-            "timezone": timezone,
+            "timezone": display_timezone,
             "duration_minutes": duration_minutes,
             "total_attendees": len(attendees),
             "top_time_slots": [],
@@ -999,7 +1134,7 @@ def suggest_meeting_times(
     return {
         "success": True,
         "search_range": {"start": start, "end": end},
-        "timezone": timezone,
+        "timezone": display_timezone,
         "duration_minutes": duration_minutes,
         "total_attendees": total_attendees,
         "top_time_slots": top_slots,
@@ -1080,7 +1215,7 @@ def list_calendars(token: str = None) -> List[Dict[str, Any]]:
 # DISPLAY HELPERS
 # =============================================================================
 
-def display_event_list(events: List[Dict], timezone: str = 'Asia/Shanghai'):
+def display_event_list(events: List[Dict], timezone: str):
     """Display a list of events in a readable format with timezone conversion."""
     from zoneinfo import ZoneInfo
     
@@ -1205,7 +1340,7 @@ def display_event_list(events: List[Dict], timezone: str = 'Asia/Shanghai'):
                     emails=[my_email],
                     start=start_dt.isoformat(),
                     end=end_dt.isoformat(),
-                    timezone='UTC'
+                    display_timezone=timezone
                 )
                 
                 # Parse availability
@@ -1283,7 +1418,7 @@ def display_event(event: Dict):
     print(f"\n{'='*80}")
 
 
-def display_availability(data: Dict, timezone: str = 'UTC', query_start: str = None, query_end: str = None):
+def display_availability(data: Dict, timezone: str, query_start: str = None, query_end: str = None):
     """Display availability information with timezone conversion and multi-person comparison."""
     from zoneinfo import ZoneInfo
     from datetime import datetime, timedelta
@@ -1319,9 +1454,27 @@ def display_availability(data: Dict, timezone: str = 'UTC', query_start: str = N
     
     schedules = data.get("value", [])
     
-    # Get all email addresses and fetch display names
-    all_emails = [schedule.get("scheduleId", "Unknown") for schedule in schedules]
-    email_to_name = get_users_info(all_emails)
+    # Extract display names from schedule data (more efficient than separate API calls)
+    email_to_name = {}
+    for schedule in schedules:
+        email = schedule.get("scheduleId", "Unknown")
+        # Try to get display name from availability response first
+        availability_view = schedule.get("availabilityView", "")
+        # Check if there's a display name in the response
+        # Microsoft Graph may include it in some responses, but typically scheduleId is just the email
+        # So we'll use get_users_info as fallback, but with better error handling
+        email_to_name[email] = email.split('@')[0]  # Default to short name
+    
+    # Try to get better names from get_users_info (if API quota allows)
+    try:
+        all_emails = [schedule.get("scheduleId", "Unknown") for schedule in schedules]
+        better_names = get_users_info(all_emails)
+        # Only update if we got actual names (not just fallbacks)
+        for email, name in better_names.items():
+            if name != email.split('@')[0]:  # If it's not just the email username
+                email_to_name[email] = name
+    except:
+        pass  # Use the default names we already set
     
     # Extract time range from availability data to fetch full event details
     # We'll fetch events for the current user to get complete information
@@ -1366,7 +1519,8 @@ def display_availability(data: Dict, timezone: str = 'UTC', query_start: str = N
             
             events = list_events(
                 start=time_range_start.strftime("%Y-%m-%dT%H:%M:%S"),
-                end=time_range_end.strftime("%Y-%m-%dT%H:%M:%S")
+                end=time_range_end.strftime("%Y-%m-%dT%H:%M:%S"),
+                display_timezone=timezone
             )
             
             # Index events by subject and start time for quick lookup
@@ -1861,10 +2015,10 @@ def main():
     # List command
     list_parser = subparsers.add_parser("list", help="List calendar events")
     list_parser.add_argument("--calendar", help="Calendar ID")
-    list_parser.add_argument("--start", help="Start datetime")
-    list_parser.add_argument("--end", help="End datetime")
+    list_parser.add_argument("--start", help="Start datetime (format: '2026-03-26T12:00:00' or 'now')")
+    list_parser.add_argument("--end", help="End datetime (format: '2026-03-26T12:00:00' or 'now')")
     list_parser.add_argument("--limit", type=int, default=25, help="Max events")
-    list_parser.add_argument("--timezone", default="Asia/Shanghai", help="Display timezone (default: Asia/Shanghai)")
+    list_parser.add_argument("--timezone", required=True, help="Display timezone (e.g., 'Asia/Shanghai', 'UTC')")
     
     # Get command
     get_parser = subparsers.add_parser("get", help="Get an event")
@@ -1873,9 +2027,9 @@ def main():
     # Create command
     create_parser = subparsers.add_parser("create", help="Create an event")
     create_parser.add_argument("--subject", required=True, help="Event subject")
-    create_parser.add_argument("--start", required=True, help="Start datetime")
-    create_parser.add_argument("--end", required=True, help="End datetime")
-    create_parser.add_argument("--timezone", default="UTC", help="Timezone")
+    create_parser.add_argument("--start", required=True, help="Start datetime (format: '2026-03-26T12:00:00' or 'now')")
+    create_parser.add_argument("--end", required=True, help="End datetime (format: '2026-03-26T12:00:00' or 'now')")
+    create_parser.add_argument("--timezone", required=True, help="Display timezone (e.g., 'Asia/Shanghai', 'UTC')")
     create_parser.add_argument("--body", help="Event description")
     create_parser.add_argument("--location", help="Location")
     create_parser.add_argument("--attendees", help="Attendee emails (comma-separated)")
@@ -1886,8 +2040,8 @@ def main():
     update_parser = subparsers.add_parser("update", help="Update an event")
     update_parser.add_argument("event_id", help="Event ID")
     update_parser.add_argument("--subject", help="New subject")
-    update_parser.add_argument("--start", help="New start datetime")
-    update_parser.add_argument("--end", help="New end datetime")
+    update_parser.add_argument("--start", help="New start datetime (format: '2026-03-26T12:00:00' or 'now')")
+    update_parser.add_argument("--end", help="New end datetime (format: '2026-03-26T12:00:00' or 'now')")
     update_parser.add_argument("--body", help="New description")
     update_parser.add_argument("--location", help="New location")
     
@@ -1899,9 +2053,9 @@ def main():
     # Availability command
     avail_parser = subparsers.add_parser("availability", help="Get availability")
     avail_parser.add_argument("--emails", required=True, help="Email addresses (comma-separated)")
-    avail_parser.add_argument("--start", required=True, help="Start datetime")
-    avail_parser.add_argument("--end", required=True, help="End datetime")
-    avail_parser.add_argument("--timezone", default="UTC", help="Timezone")
+    avail_parser.add_argument("--start", required=True, help="Start datetime (format: '2026-03-26T12:00:00')")
+    avail_parser.add_argument("--end", required=True, help="End datetime (format: '2026-03-26T12:00:00' or 'now')")
+    avail_parser.add_argument("--timezone", required=True, help="Display timezone (e.g., 'Asia/Shanghai', 'UTC')")
     
     # Accept command
     accept_parser = subparsers.add_parser("accept", help="Accept an event invitation")
@@ -1936,17 +2090,17 @@ def main():
     suggest_parser = subparsers.add_parser("suggest", help="Suggest optimal meeting times based on attendee availability")
     suggest_parser.add_argument("--attendees", required=True, help="Attendee emails (comma-separated)")
     suggest_parser.add_argument("--duration", type=int, default=60, help="Meeting duration in minutes (default 60)")
-    suggest_parser.add_argument("--start", help="Search start datetime (default: now)")
-    suggest_parser.add_argument("--end", help="Search end datetime (default: 7 days)")
-    suggest_parser.add_argument("--timezone", default="UTC", help="Timezone (default UTC)")
+    suggest_parser.add_argument("--start", help="Search start datetime (format: '2026-03-26T12:00:00' or 'now', default: now)")
+    suggest_parser.add_argument("--end", help="Search end datetime (format: '2026-03-26T12:00:00' or 'now', default: 7 days from now)")
+    suggest_parser.add_argument("--timezone", required=True, help="Display timezone (e.g., 'Asia/Shanghai', 'UTC')")
     suggest_parser.add_argument("--top", type=int, default=5, help="Number of top slots to show (default 5)")
     
     # Propose new time command
     propose_parser = subparsers.add_parser("propose", help="Propose a new meeting time")
     propose_parser.add_argument("event_id", help="Event ID")
-    propose_parser.add_argument("--start", required=True, help="Proposed new start datetime")
-    propose_parser.add_argument("--end", required=True, help="Proposed new end datetime")
-    propose_parser.add_argument("--timezone", default="UTC", help="Timezone")
+    propose_parser.add_argument("--start", required=True, help="Proposed new start datetime (format: '2026-03-26T12:00:00' or 'now')")
+    propose_parser.add_argument("--end", required=True, help="Proposed new end datetime (format: '2026-03-26T12:00:00' or 'now')")
+    propose_parser.add_argument("--timezone", required=True, help="Display timezone (e.g., 'Asia/Shanghai', 'UTC')")
     propose_parser.add_argument("--comment", help="Optional message to organizer")
     
     # List calendars command
@@ -1960,12 +2114,13 @@ def main():
                 calendar_id=args.calendar,
                 start=args.start,
                 end=args.end,
-                limit=args.limit
+                limit=args.limit,
+                display_timezone=args.timezone
             )
             if args.json:
                 print(json.dumps({"success": True, "events": events, "total": len(events)}, indent=2, default=str))
             else:
-                display_event_list(events, timezone=args.timezone if hasattr(args, 'timezone') and args.timezone else 'Asia/Shanghai')
+                display_event_list(events, timezone=args.timezone)
         
         elif args.command == "get":
             event = get_event(args.event_id)
@@ -1983,7 +2138,7 @@ def main():
                 subject=args.subject,
                 start=args.start,
                 end=args.end,
-                timezone=args.timezone,
+                display_timezone=args.timezone,
                 body=args.body,
                 location=args.location,
                 attendees=attendees,
@@ -2003,6 +2158,7 @@ def main():
         elif args.command == "update":
             event = update_event(
                 event_id=args.event_id,
+                display_timezone=args.timezone,
                 subject=args.subject,
                 start=args.start,
                 end=args.end,
@@ -2024,16 +2180,20 @@ def main():
                 print(msg)
         
         elif args.command == "availability":
+            # Validate that start is not "now"
+            if args.start.lower() == "now":
+                raise ValueError("--start cannot be 'now' for availability checks. Please provide a specific datetime like '2026-03-26T12:00:00'")
+            
             data = get_availability(
                 emails=parse_email_list(args.emails),
                 start=args.start,
                 end=args.end,
-                timezone=args.timezone
+                display_timezone=args.timezone
             )
             if args.json:
                 print(json.dumps({"success": True, "availability": data}, indent=2, default=str))
             else:
-                display_availability(data, timezone=args.timezone if hasattr(args, 'timezone') and args.timezone else 'UTC', query_start=args.start, query_end=args.end)
+                display_availability(data, timezone=args.timezone, query_start=args.start, query_end=args.end)
         
         elif args.command == "calendars":
             calendars = list_calendars()
@@ -2103,7 +2263,7 @@ def main():
                 event_id=args.event_id,
                 new_start=args.start,
                 new_end=args.end,
-                timezone=args.timezone,
+                display_timezone=args.timezone,
                 comment=args.comment
             )
             if args.json:
@@ -2117,7 +2277,7 @@ def main():
                 duration_minutes=args.duration,
                 start=args.start,
                 end=args.end,
-                timezone=args.timezone,
+                display_timezone=args.timezone,
                 top_n=args.top
             )
             if args.json:

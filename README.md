@@ -1,65 +1,30 @@
-# Microsoft Graph Skill - Detailed Examples
+# Microsoft Graph Skill
 
-## Email Operations Examples
+A Python-based skill for interacting with Microsoft 365 services through the Microsoft Graph API.
 
-### Search by Sender
-```bash
-py -3 email_operations.py list --from "sswarupa@in.ibm.com" --top 5
-py -3 email_operations.py list --from "John Smith" --top 10
-```
+## Features
 
-### Search by Subject
-```bash
-py -3 email_operations.py list --subject "RHCSA" --top 5
-```
+- **Email Operations**: Search, list, read, and manage emails across different folders
+- **Calendar Management**: View, create, update, and delete calendar events
+- **User Information**: Retrieve user profile and organizational data
+- **Attachment Handling**: List and download email attachments
 
-### Search by Date (use --filter for date queries)
-```bash
-py -3 email_operations.py list --filter "receivedDateTime ge 2026-03-24T00:00:00Z" --top 20
-```
+## Quick Start
 
-### Search in Specific Folders
-```bash
-py -3 email_operations.py list --folder sent --top 10
-py -3 email_operations.py find --folder drafts --subject "report"
-py -3 email_operations.py search --folder deleted --from "john"
-```
+1. Install dependencies: `pip install -r requirements.txt`
+2. Configure authentication in `config.py`
+3. Run operations using the scripts in the `scripts/` directory
 
-### Search Across ALL Folders
-```bash
-py -3 email_operations.py list --folder all --from "beng"
-```
+## Documentation
 
-### List All Available Folders
-```bash
-py -3 email_operations.py folders
-```
+For detailed usage instructions, API endpoints, and examples, see [SKILL.md](SKILL.md).
 
-### Outlook Syntax Auto-Conversion
-```bash
-py -3 email_operations.py find --from "from:beng"  # Auto-converts to --from "beng"
-```
+## Project Structure
 
-## Attachment Examples
+- `scripts/` - Main operation scripts for email, calendar, and user management
+- `references/` - API documentation and permission requirements
+- `config.py` - Authentication and configuration settings
 
-```bash
-# List attachments
-py -3 email_operations.py attachments <message_id>
+---
 
-# Download all attachments (default to Desktop)
-py -3 email_operations.py attachments <message_id> --download
-
-# Download to specific directory
-py -3 email_operations.py attachments <message_id> --download --save-dir ~/Downloads
-
-# Download specific attachment
-py -3 email_operations.py attachments <message_id> --id <attachment_id> -d
-```
-
-## Common Mistakes to Avoid
-
-| Wrong | Correct | Reason |
-|-------|---------|--------|
-| `search --query "from:email"` | `list --from "email"` | No --query parameter |
-| `find "email"` | `list --from "email"` | Positional args not supported |
-| `list --filter "from/..."` | `list --from "email"` | Too complex, use --from |
+Made with Bob
