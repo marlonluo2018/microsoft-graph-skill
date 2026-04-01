@@ -46,17 +46,23 @@ version: 1.0.0
 |--------|---------|
 | List | `list --timezone TZ [--start TS] [--end TS]` |
 | Get | `get <event_id>` |
-| Create | `create --subject TXT --start TS --end TS --timezone TZ [--attendees EMAILS]` |
-| Update | `update <event_id> --timezone TZ [--subject TXT]` |
+| Create | `create --subject TXT --start TS --end TS --timezone TZ [--required EMAILS] [--optional EMAILS] [--no-teams]` *(Teams enabled by default)* |
+| Update | `update <event_id> --timezone TZ [--subject TXT] [--required EMAILS] [--optional EMAILS]` |
 | Delete | `delete <event_id> [--permanent]` |
-| Availability | `availability --emails EMAILS --start TS --end TS --timezone TZ` |
-| Suggest | `suggest --attendees EMAILS --timezone TZ [--duration MIN]` |
+| Cancel | `cancel <event_id> [--comment TXT]` *(organizer only, notifies attendees)* |
+| Forward | `forward <event_id> --to EMAILS [--comment TXT]` |
+| Availability | `availability --emails EMAILS --start TS --end TS --timezone TZ` *(includes smart meeting suggestions)* |
 | Propose | `propose <event_id> --start TS --end TS --timezone TZ` |
 | Accept/Decline/Tentative | `accept|decline|tentative <event_id>` |
 
 **Required:** `--timezone` ⚠️ (e.g., "Asia/Shanghai", "UTC")
 
-**Options:** `--attendees`, `--emails` (comma-separated)
+**Attendee Types:**
+- `--required EMAILS` - Required attendees (must attend)
+- `--optional EMAILS` - Optional attendees (nice to have)
+- Can use both parameters together to specify different types
+
+**Other Options:** `--emails` (comma-separated for availability checks)
 
 ## Time Format
 

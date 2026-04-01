@@ -1767,93 +1767,41 @@ def display_availability(data: Dict, timezone: str, query_start: str = None, que
             # Extract short name from email (e.g., "luomn" from "luomn@cn.ibm.com")
             print(f"  {display_name:<{max_name_len}} | {colored_view}  [{wh_display_str}]")
         
-        # Add smart meeting suggestions based on individual slot analysis
+        # Add smart meeting suggestions using suggest_meeting_times function
         if len(schedules) > 1 and all_views:
-            print(f"\n💡 Smart Meeting Suggestions (sorted by availability):")
-            
-            # Analyze each 30-min slot
-            slot_analysis = []
-            view_length = len(all_views[0]) if all_views else 0
-            
-            # Get working hours info for each person
-            person_working_hours = {}
-            for email in all_emails:
-                wh = working_hours_info.get(email, {})
-                wh_start_str = wh.get('start', '09:00:00')
-                wh_end_str = wh.get('end', '18:00:00')
-                wh_tz_name = wh.get('timezone', 'UTC')
-                
-                try:
-                    from zoneinfo import ZoneInfo
-                    from datetime import datetime
-                    
-                    tz_map = {
-                        'China Standard Time': 'Asia/Shanghai',
-                        'India Standard Time': 'Asia/Kolkata',
-                        'Singapore Standard Time': 'Asia/Singapore',
-                        'Pacific Standard Time': 'America/Los_Angeles',
-                        'Eastern Standard Time': 'America/New_York',
-                        'GMT Standard Time': 'Europe/London',
-                        'UTC': 'UTC'
-                    }
-                    
-                    iana_tz_name = tz_map.get(wh_tz_name, wh_tz_name)
-                    wh_start_time = datetime.strptime(wh_start_str[:5], '%H:%M').time()
-                    wh_end_time = datetime.strptime(wh_end_str[:5], '%H:%M').time()
-                    
-                    today = datetime.now(ZoneInfo(iana_tz_name)).date()
-                    wh_start_dt = datetime.combine(today, wh_start_time, tzinfo=ZoneInfo(iana_tz_name))
-                    wh_end_dt = datetime.combine(today, wh_end_time, tzinfo=ZoneInfo(iana_tz_name))
-                    
-                    display_tz = ZoneInfo(timezone)
-                    wh_start_display = wh_start_dt.astimezone(display_tz)
-                    wh_end_display = wh_end_dt.astimezone(display_tz)
-                    
-                    start_slot = wh_start_display.hour * 2 + (1 if wh_start_display.minute >= 30 else 0)
-                    end_slot = wh_end_display.hour * 2 + (1 if wh_end_display.minute >= 30 else 0)
-                    
-                    person_working_hours[email] = (start_slot, end_slot)
-                except:
-                    person_working_hours[email] = (18, 36)  # Default 9:00-18:00
-            
-            # Analyze each slot
-            for slot_idx in range(view_length):
-                # Calculate actual slot index (slot_idx is relative to query start time)
-                actual_slot = query_start_slot + slot_idx
-                
-                # Check if slot is within ALL people's working hours
-                in_all_working_hours = all(
-                    start <= actual_slot < end
-                    for start, end in person_working_hours.values()
+            try:
+                # Use suggest_meeting_times for intelligent recommendations
+                suggestions = suggest_meeting_times(
+                    attendees=all_emails,
+                    display_timezone=timezone,
+                    duration_minutes=30,  # Default 30 minute meeting
+                    start=query_start,
+                    end=query_end,
+                    top_n=5,
+                    interval=30
                 )
                 
-                if not in_all_working_hours:
-                    continue
-                
-                # Count how many people are free in this slot
-                free_count = sum(
-                    1 for view in all_views
-                    if slot_idx < len(view) and view[slot_idx] == '0'
-                )
-                
-                # Calculate time using actual slot index
-                slot_mins = actual_slot * 30
-                slot_time = f"{slot_mins // 60:02d}:{slot_mins % 60:02d}"
-                
-                slot_analysis.append((slot_time, free_count, len(all_emails)))
-            
-            # Sort by free count (descending) and then by time
-            slot_analysis.sort(key=lambda x: (-x[1], x[0]))
-            
-            # Display top 10 slots
-            displayed = 0
-            for slot_time, free_count, total_count in slot_analysis:
-                if displayed >= 10:
-                    break
-                if free_count > 0:
-                    percentage = (free_count / total_count) * 100
-                    print(f"  • {slot_time}: {free_count}/{total_count} people free ({percentage:.0f}%)")
-                    displayed += 1
+                if suggestions.get("top_time_slots"):
+                    print(f"\n💡 Smart Meeting Suggestions (30-minute meetings):")
+                    for slot in suggestions["top_time_slots"]:
+                        all_free_indicator = "✓ All free" if slot["all_free"] else f"{slot['free_count']}/{slot['total_attendees']} available"
+                        print(f"  #{slot['rank']}. {slot['start']} - {slot['end']} | Score: {slot['score']} | {all_free_indicator}")
+                        
+                        # Show unavailable attendees if any
+                        if slot["unavailable_attendees"] and not slot["all_free"]:
+                            unavailable_names = []
+                            for u in slot["unavailable_attendees"][:3]:  # Show first 3
+                                name = email_to_name.get(u['email'], u['email'].split('@')[0])
+                                unavailable_names.append(f"{name} ({u['status']})")
+                            unavailable_str = ", ".join(unavailable_names)
+                            if len(slot["unavailable_attendees"]) > 3:
+                                unavailable_str += f" +{len(slot['unavailable_attendees'])-3} more"
+                            print(f"       Unavailable: {unavailable_str}")
+                else:
+                    print(f"\n💡 No suitable meeting times found in the given range")
+            except Exception as e:
+                # If suggestion fails, continue without it (don't break availability display)
+                print(f"\n💡 Smart Meeting Suggestions: Unable to generate (error: {str(e)})")
         
         print(f"\n{'='*120}")
     
@@ -2032,9 +1980,10 @@ def main():
     create_parser.add_argument("--timezone", required=True, help="Display timezone (e.g., 'Asia/Shanghai', 'UTC')")
     create_parser.add_argument("--body", help="Event description")
     create_parser.add_argument("--location", help="Location")
-    create_parser.add_argument("--attendees", help="Attendee emails (comma-separated)")
+    create_parser.add_argument("--required", help="Required attendee emails (comma-separated)")
+    create_parser.add_argument("--optional", help="Optional attendee emails (comma-separated)")
     create_parser.add_argument("--all-day", action="store_true", help="All day event")
-    create_parser.add_argument("--teams", action="store_true", help="Create Teams meeting")
+    create_parser.add_argument("--no-teams", action="store_false", dest="teams", default=True, help="Disable Teams meeting (Teams is enabled by default)")
     
     # Update command
     update_parser = subparsers.add_parser("update", help="Update an event")
@@ -2044,6 +1993,9 @@ def main():
     update_parser.add_argument("--end", help="New end datetime (format: '2026-03-26T12:00:00' or 'now')")
     update_parser.add_argument("--body", help="New description")
     update_parser.add_argument("--location", help="New location")
+    update_parser.add_argument("--required", help="Required attendee emails (comma-separated)")
+    update_parser.add_argument("--optional", help="Optional attendee emails (comma-separated)")
+    update_parser.add_argument("--timezone", help="Display timezone (e.g., 'Asia/Shanghai', 'UTC')")
     
     # Delete command
     delete_parser = subparsers.add_parser("delete", help="Soft delete an event (move to Deleted Items)")
@@ -2086,15 +2038,6 @@ def main():
     forward_parser.add_argument("--to", required=True, dest="to_emails", help="Email addresses (comma-separated)")
     forward_parser.add_argument("--comment", help="Optional message")
     
-    # Suggest meeting times command
-    suggest_parser = subparsers.add_parser("suggest", help="Suggest optimal meeting times based on attendee availability")
-    suggest_parser.add_argument("--attendees", required=True, help="Attendee emails (comma-separated)")
-    suggest_parser.add_argument("--duration", type=int, default=60, help="Meeting duration in minutes (default 60)")
-    suggest_parser.add_argument("--start", help="Search start datetime (format: '2026-03-26T12:00:00' or 'now', default: now)")
-    suggest_parser.add_argument("--end", help="Search end datetime (format: '2026-03-26T12:00:00' or 'now', default: 7 days from now)")
-    suggest_parser.add_argument("--timezone", required=True, help="Display timezone (e.g., 'Asia/Shanghai', 'UTC')")
-    suggest_parser.add_argument("--top", type=int, default=5, help="Number of top slots to show (default 5)")
-    
     # Propose new time command
     propose_parser = subparsers.add_parser("propose", help="Propose a new meeting time")
     propose_parser.add_argument("event_id", help="Event ID")
@@ -2130,9 +2073,19 @@ def main():
                 display_event(event)
         
         elif args.command == "create":
-            attendees = None
-            if args.attendees:
-                attendees = [{"email": e} for e in parse_email_list(args.attendees)]
+            attendees = []
+            
+            # Process --required
+            if args.required:
+                attendees.extend([{"email": e, "type": "required"} for e in parse_email_list(args.required)])
+            
+            # Process --optional
+            if args.optional:
+                attendees.extend([{"email": e, "type": "optional"} for e in parse_email_list(args.optional)])
+            
+            # If no attendees specified, set to None
+            if not attendees:
+                attendees = None
             
             event = create_event(
                 subject=args.subject,
@@ -2156,6 +2109,20 @@ def main():
                     print(f"  Teams Link: {event['onlineMeeting'].get('joinUrl')}")
         
         elif args.command == "update":
+            attendees = None
+            
+            # Process attendees only if any are specified
+            if args.required or args.optional:
+                attendees = []
+                
+                # Process --required
+                if args.required:
+                    attendees.extend([{"email": e, "type": "required"} for e in parse_email_list(args.required)])
+                
+                # Process --optional
+                if args.optional:
+                    attendees.extend([{"email": e, "type": "optional"} for e in parse_email_list(args.optional)])
+            
             event = update_event(
                 event_id=args.event_id,
                 display_timezone=args.timezone,
@@ -2163,7 +2130,8 @@ def main():
                 start=args.start,
                 end=args.end,
                 body=args.body,
-                location=args.location
+                location=args.location,
+                attendees=attendees
             )
             if args.json:
                 print(json.dumps({"success": True, "event": event}, indent=2, default=str))
@@ -2271,34 +2239,6 @@ def main():
             else:
                 print(f"✓ New time proposed: {args.start} - {args.end}")
         
-        elif args.command == "suggest":
-            result = suggest_meeting_times(
-                attendees=parse_email_list(args.attendees),
-                duration_minutes=args.duration,
-                start=args.start,
-                end=args.end,
-                display_timezone=args.timezone,
-                top_n=args.top
-            )
-            if args.json:
-                # Remove raw_availability for cleaner JSON output
-                output = {k: v for k, v in result.items() if k != "raw_availability"}
-                print(json.dumps(output, indent=2, default=str))
-            else:
-                print(f"\n📅 Suggested Meeting Times (duration: {args.duration}min)")
-                print(f"   Attendees: {', '.join(parse_email_list(args.attendees))}")
-                print(f"   Timezone: {args.timezone}")
-                print()
-                if result["top_time_slots"]:
-                    for slot in result["top_time_slots"]:
-                        all_free = "✓ All free" if slot["all_free"] else f"{slot['free_count']}/{slot['total_attendees']} free"
-                        print(f"   #{slot['rank']} {slot['start']} - {slot['end']} (Score: {slot['score']}) - {all_free}")
-                        if slot["unavailable_attendees"]:
-                            for u in slot["unavailable_attendees"]:
-                                print(f"       - {u['email']}: {u['status']}")
-                else:
-                    print("   No suitable time slots found")
-    
     except Exception as e:
         if args.json:
             print(json.dumps({"success": False, "error": str(e)}))
