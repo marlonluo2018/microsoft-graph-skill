@@ -28,9 +28,9 @@ version: 1.0.0
 | Search | `search --timezone TZ [--from EMAIL] [--subject TXT]` |
 | Find | `find --timezone TZ [--from EMAIL] [--subject TXT]` |
 | Get Full | `get <message_id>` |
-| Send | `send --to EMAILS --subject TXT --body TXT [--attachments PATH]` |
-| Reply | `reply <id> --body TXT [--attachments PATH]` |
-| Forward | `forward <id> --to EMAILS` |
+| Send | `send --to EMAILS --subject TXT --body TXT [--cc EMAILS] [--bcc EMAILS] [--csv PATH] [--attachments PATH]` |
+| Reply | `reply <id> --body TXT [--bcc EMAILS] [--csv PATH] [--attachments PATH]` |
+| Forward | `forward <id> --to EMAILS [--bcc EMAILS] [--csv PATH]` |
 | Folders | `folders` |
 | Attachments | `attachments <message_id> [--download]` |
 | Accept Invite | `accept-invite <message_id>` |
@@ -39,6 +39,12 @@ version: 1.0.0
 **Required:** `--timezone` ⚠️ (e.g., "Asia/Shanghai", "UTC")
 
 **Options:** `--folder`, `--top N`, `--detail`, `--emails-only`, `--events-only`
+
+**BCC CSV File Support:**
+- `--csv PATH` - Load BCC recipients from CSV file (auto-detects email column)
+- `--email-column NAME` - Specify CSV column name (optional)
+- Auto-batching when total recipients exceed 500
+- Example CSV format: `email` column with one email per row
 
 ## Calendar Operations (`scripts/calendar_operations.py`)
 

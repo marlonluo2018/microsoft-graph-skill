@@ -750,10 +750,6 @@ def send_email(
     if token is None:
         token = get_access_token()
     
-    # If no To recipients but has BCC/CC, set current user as To (Graph API requires To)
-    if not to and (bcc or cc):
-        to = [get_my_email(token)]
-    
     # Validate recipients
     validate_recipients(to, cc, bcc)
     
@@ -863,51 +859,50 @@ def batch_send_email(
         }
     
     # Split recipients into batches
+    # IMPORTANT: To and CC recipients must be in EVERY batch (they're not distributed)
+    # Only BCC recipients are distributed across batches
+    # This ensures we stay under the 500 recipient limit per batch
     sent_count = 0
     failed_count = 0
     errors = []
     
-    # Combine all recipients into a single list with type labels
-    all_recipients = []
-    if to:
-        all_recipients.extend([("to", email) for email in to])
-    if cc:
-        all_recipients.extend([("cc", email) for email in cc])
-    if bcc:
-        all_recipients.extend([("bcc", email) for email in bcc])
+    # Calculate how many BCC recipients can fit in each batch
+    # Reserve space for To and CC recipients that will be in every batch
+    fixed_recipients_count = to_count + cc_count
+    bcc_per_batch = MAX_RECIPIENTS - fixed_recipients_count
     
-    # Split into batches of MAX_RECIPIENTS
+    if bcc_per_batch <= 0:
+        raise ValueError(
+            f"To ({to_count}) + CC ({cc_count}) recipients already exceed or equal the limit of {MAX_RECIPIENTS}. "
+            f"Cannot add BCC recipients. Please reduce To/CC recipients."
+        )
+    
+    # Split BCC recipients into batches
     batches = []
-    current_batch = {"to": [], "cc": [], "bcc": []}
-    current_count = 0
+    bcc_list = bcc or []
     
-    for recipient_type, email in all_recipients:
-        if current_count >= MAX_RECIPIENTS:
-            batches.append(current_batch)
-            current_batch = {"to": [], "cc": [], "bcc": []}
-            current_count = 0
-        
-        current_batch[recipient_type].append(email)
-        current_count += 1
-    
-    # Don't forget the last batch
-    if current_batch["to"] or current_batch["cc"] or current_batch["bcc"]:
-        batches.append(current_batch)
+    for i in range(0, len(bcc_list), bcc_per_batch):
+        batch_bcc = bcc_list[i:i + bcc_per_batch]
+        batches.append({
+            "to": to if to else None,  # Same To in every batch
+            "cc": cc if cc else None,  # Same CC in every batch
+            "bcc": batch_bcc
+        })
     
     # Send each batch
     for idx, batch in enumerate(batches, 1):
-        batch_to_count = len(batch["to"])
-        batch_cc_count = len(batch["cc"])
-        batch_bcc_count = len(batch["bcc"])
+        batch_to_count = len(batch["to"]) if batch["to"] else 0
+        batch_cc_count = len(batch["cc"]) if batch["cc"] else 0
+        batch_bcc_count = len(batch["bcc"]) if batch["bcc"] else 0
         batch_total = batch_to_count + batch_cc_count + batch_bcc_count
         
         try:
             send_email(
-                to=batch["to"] if batch["to"] else None,
+                to=batch["to"],
                 subject=subject,
                 body=body,
-                cc=batch["cc"] if batch["cc"] else None,
-                bcc=batch["bcc"] if batch["bcc"] else None,
+                cc=batch["cc"],
+                bcc=batch["bcc"],
                 body_type=body_type,
                 attachments=attachments,
                 importance=importance,
@@ -1213,51 +1208,50 @@ def batch_reply_email(
         }
     
     # Split recipients into batches
+    # IMPORTANT: To and CC recipients must be in EVERY batch (they're not distributed)
+    # Only BCC recipients are distributed across batches
+    # This ensures we stay under the 500 recipient limit per batch
     sent_count = 0
     failed_count = 0
     errors = []
     
-    # Combine all recipients into a single list with type labels
-    all_recipients = []
-    if to:
-        all_recipients.extend([("to", email) for email in to])
-    if cc:
-        all_recipients.extend([("cc", email) for email in cc])
-    if bcc:
-        all_recipients.extend([("bcc", email) for email in bcc])
+    # Calculate how many BCC recipients can fit in each batch
+    # Reserve space for To and CC recipients that will be in every batch
+    fixed_recipients_count = to_count + cc_count
+    bcc_per_batch = MAX_RECIPIENTS - fixed_recipients_count
     
-    # Split into batches of MAX_RECIPIENTS
+    if bcc_per_batch <= 0:
+        raise ValueError(
+            f"To ({to_count}) + CC ({cc_count}) recipients already exceed or equal the limit of {MAX_RECIPIENTS}. "
+            f"Cannot add BCC recipients. Please reduce To/CC recipients."
+        )
+    
+    # Split BCC recipients into batches
     batches = []
-    current_batch = {"to": [], "cc": [], "bcc": []}
-    current_count = 0
+    bcc_list = bcc or []
     
-    for recipient_type, email in all_recipients:
-        if current_count >= MAX_RECIPIENTS:
-            batches.append(current_batch)
-            current_batch = {"to": [], "cc": [], "bcc": []}
-            current_count = 0
-        
-        current_batch[recipient_type].append(email)
-        current_count += 1
-    
-    # Don't forget the last batch
-    if current_batch["to"] or current_batch["cc"] or current_batch["bcc"]:
-        batches.append(current_batch)
+    for i in range(0, len(bcc_list), bcc_per_batch):
+        batch_bcc = bcc_list[i:i + bcc_per_batch]
+        batches.append({
+            "to": to if to else None,  # Same To in every batch
+            "cc": cc if cc else None,  # Same CC in every batch
+            "bcc": batch_bcc
+        })
     
     # Send each batch
     for idx, batch in enumerate(batches, 1):
-        batch_to_count = len(batch["to"])
-        batch_cc_count = len(batch["cc"])
-        batch_bcc_count = len(batch["bcc"])
+        batch_to_count = len(batch["to"]) if batch["to"] else 0
+        batch_cc_count = len(batch["cc"]) if batch["cc"] else 0
+        batch_bcc_count = len(batch["bcc"]) if batch["bcc"] else 0
         batch_total = batch_to_count + batch_cc_count + batch_bcc_count
         
         try:
             send_email(
-                to=batch["to"] if batch["to"] else None,
+                to=batch["to"],
                 subject=subject,
                 body=full_body,
-                cc=batch["cc"] if batch["cc"] else None,
-                bcc=batch["bcc"] if batch["bcc"] else None,
+                cc=batch["cc"],
+                bcc=batch["bcc"],
                 body_type=body_type,
                 importance=importance,
                 token=token
@@ -1347,10 +1341,6 @@ def forward_email(
     if token is None:
         token = get_access_token()
     
-    # If no To recipients but has BCC/CC, set current user as To (Graph API requires To)
-    if not to and (bcc or cc):
-        to = [get_my_email(token)]
-    
     # Validate recipients
     validate_recipients(to, cc, bcc)
     
@@ -1358,7 +1348,7 @@ def forward_email(
     url = f"{GRAPH_API_BASE}/me/messages/{message_id}/forward"
     
     # Build recipient lists
-    to_recipients = [{"emailAddress": {"address": email}} for email in to]
+    to_recipients = [{"emailAddress": {"address": email}} for email in (to or [])]
     cc_recipients = [{"emailAddress": {"address": email}} for email in (cc or [])]
     bcc_recipients = [{"emailAddress": {"address": email}} for email in (bcc or [])]
     
@@ -1448,10 +1438,12 @@ def batch_forward_email(
         # Merge with any manually specified BCC
         bcc = (bcc or []) + csv_bcc
     
-    # If no To recipients but has BCC/CC, set current user as To (Graph API requires To)
+    # Microsoft Graph API requires at least one To recipient for forward
+    # If no To recipient specified but has BCC/CC, add current user as To
     if not to and (bcc or cc):
         to = [get_my_email(token)]
-        print(f"ℹ️  No To recipient specified, using current user as To: {to[0]}")
+        print(f"ℹ️  Graph API requires To recipient - using current user: {to[0]}")
+        print(f"💡 All other recipients will be in BCC (hidden from each other)")
     
     # Calculate total recipients
     to_count = len(to) if to else 0
@@ -1474,50 +1466,49 @@ def batch_forward_email(
         }
     
     # Split recipients into batches
+    # IMPORTANT: To and CC recipients must be in EVERY batch (they're not distributed)
+    # Only BCC recipients are distributed across batches
+    # This ensures we stay under the 500 recipient limit per batch
     sent_count = 0
     failed_count = 0
     errors = []
     
-    # Combine all recipients into a single list with type labels
-    all_recipients = []
-    if to:
-        all_recipients.extend([("to", email) for email in to])
-    if cc:
-        all_recipients.extend([("cc", email) for email in cc])
-    if bcc:
-        all_recipients.extend([("bcc", email) for email in bcc])
+    # Calculate how many BCC recipients can fit in each batch
+    # Reserve space for To and CC recipients that will be in every batch
+    fixed_recipients_count = to_count + cc_count
+    bcc_per_batch = MAX_RECIPIENTS - fixed_recipients_count
     
-    # Split into batches of MAX_RECIPIENTS
+    if bcc_per_batch <= 0:
+        raise ValueError(
+            f"To ({to_count}) + CC ({cc_count}) recipients already exceed or equal the limit of {MAX_RECIPIENTS}. "
+            f"Cannot add BCC recipients. Please reduce To/CC recipients."
+        )
+    
+    # Split BCC recipients into batches
     batches = []
-    current_batch = {"to": [], "cc": [], "bcc": []}
-    current_count = 0
+    bcc_list = bcc or []
     
-    for recipient_type, email in all_recipients:
-        if current_count >= MAX_RECIPIENTS:
-            batches.append(current_batch)
-            current_batch = {"to": [], "cc": [], "bcc": []}
-            current_count = 0
-        
-        current_batch[recipient_type].append(email)
-        current_count += 1
-    
-    # Don't forget the last batch
-    if current_batch["to"] or current_batch["cc"] or current_batch["bcc"]:
-        batches.append(current_batch)
+    for i in range(0, len(bcc_list), bcc_per_batch):
+        batch_bcc = bcc_list[i:i + bcc_per_batch]
+        batches.append({
+            "to": to if to else None,  # Same To in every batch
+            "cc": cc if cc else None,  # Same CC in every batch
+            "bcc": batch_bcc
+        })
     
     # Send each batch
     for idx, batch in enumerate(batches, 1):
-        batch_to_count = len(batch["to"])
-        batch_cc_count = len(batch["cc"])
-        batch_bcc_count = len(batch["bcc"])
+        batch_to_count = len(batch["to"]) if batch["to"] else 0
+        batch_cc_count = len(batch["cc"]) if batch["cc"] else 0
+        batch_bcc_count = len(batch["bcc"]) if batch["bcc"] else 0
         batch_total = batch_to_count + batch_cc_count + batch_bcc_count
         
         try:
             forward_email(
                 message_id=message_id,
-                to=batch["to"] if batch["to"] else None,
-                cc=batch["cc"] if batch["cc"] else None,
-                bcc=batch["bcc"] if batch["bcc"] else None,
+                to=batch["to"],
+                cc=batch["cc"],
+                bcc=batch["bcc"],
                 comment=comment,
                 body_type=body_type,
                 token=token
