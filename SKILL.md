@@ -1,9 +1,9 @@
 ---
 name: microsoft-graph-skill
 description: |
-  Microsoft Graph API for email, calendar, and user operations.  
+  Microsoft Graph API for email, calendar, and user operations.
   **Triggers:** "read my emails", "send an email", "check calendar", "create meeting".
-version: 1.0.0
+  **Time parameters:** `--end` supports "now" keyword (e.g., `--end "now"`).
 ---
 
 # Microsoft Graph Skill
@@ -77,7 +77,7 @@ version: 1.0.0
 | Format | Example |
 |--------|---------|
 | Plain datetime | `--start "2026-03-26T12:00:00" --timezone "Asia/Shanghai"` |
-| Special | `--start "now" --timezone "Asia/Shanghai"` |
+| Special | `--end "now" --timezone "Asia/Shanghai"` |
 
 **Note:** Embedded timezone (`Z` or `+08:00`) is NOT supported. Always use `--timezone`.
 
