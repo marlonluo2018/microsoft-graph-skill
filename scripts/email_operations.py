@@ -1179,11 +1179,51 @@ def batch_reply_email(
     bcc_count = len(bcc) if bcc else 0
     total_recipients = to_count + cc_count + bcc_count
     
-    # Get original message for subject
+    # Get original message for subject and recipients
     original_msg = get_message(message_id, token)
     subject = original_msg.get('subject', '')
     if not subject.upper().startswith('RE:'):
         subject = f"RE: {subject}"
+    
+    # If no custom recipients specified, extract from original message (reply-all behavior)
+    if not to and not cc and not bcc:
+        # Get current user's email to exclude from recipients
+        my_email = get_my_email(token)
+        
+        # Extract sender from original message
+        from_addr = original_msg.get('from', {}).get('emailAddress', {})
+        sender_email = from_addr.get('address', '')
+        
+        # Extract other To recipients (excluding current user)
+        to_recipients = original_msg.get('toRecipients', [])
+        other_to_emails = [
+            r.get('emailAddress', {}).get('address', '')
+            for r in to_recipients
+            if r.get('emailAddress', {}).get('address', '').lower() != my_email.lower()
+        ]
+        
+        # Extract CC recipients
+        cc_recipients = original_msg.get('ccRecipients', [])
+        cc_emails = [
+            r.get('emailAddress', {}).get('address', '')
+            for r in cc_recipients
+        ]
+        
+        # Build To list: sender + other To recipients (excluding self)
+        to = []
+        if sender_email:
+            to.append(sender_email)
+        to.extend(other_to_emails)
+        
+        # Build CC list from original CC recipients
+        if cc_emails:
+            cc = cc_emails
+        
+        if to:
+            print(f"ℹ️  Auto-extracted recipients from original email:")
+            print(f"   To: {', '.join(to)}")
+            if cc:
+                print(f"   CC: {', '.join(cc)}")
     
     # Build email body with history
     if include_history and body_type == "html":
@@ -2975,8 +3015,15 @@ def main():
             inline_attachments = None
             large_files = []
             if hasattr(args, 'attachments') and args.attachments:
+                # Parse comma-separated file paths (similar to email parsing)
+                file_list = []
+                for att_arg in args.attachments:
+                    # Split by comma and strip whitespace
+                    files = [f.strip() for f in att_arg.split(',') if f.strip()]
+                    file_list.extend(files)
+                
                 try:
-                    inline_attachments, large_files = prepare_file_attachments(args.attachments)
+                    inline_attachments, large_files = prepare_file_attachments(file_list)
                     if inline_attachments:
                         print(f"✓ Prepared {len(inline_attachments)} inline attachment(s)")
                     if large_files:
@@ -3054,8 +3101,15 @@ def main():
             inline_attachments = None
             large_files = []
             if hasattr(args, 'attachments') and args.attachments:
+                # Parse comma-separated file paths (similar to email parsing)
+                file_list = []
+                for att_arg in args.attachments:
+                    # Split by comma and strip whitespace
+                    files = [f.strip() for f in att_arg.split(',') if f.strip()]
+                    file_list.extend(files)
+                
                 try:
-                    inline_attachments, large_files = prepare_file_attachments(args.attachments)
+                    inline_attachments, large_files = prepare_file_attachments(file_list)
                     if inline_attachments:
                         print(f"✓ Prepared {len(inline_attachments)} inline attachment(s)")
                     if large_files:
