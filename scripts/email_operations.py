@@ -403,7 +403,7 @@ def list_messages(
         
         # KQL: Add start to $search whenever $search is used
         # This avoids $search + $filter conflict (Graph API doesn't allow both)
-        # NOTE: KQL only supports date format (YYYY-MM-DD), but we still require timezone for validation
+        # NOTE: KQL only supports date format (YYYY-MM-DD)
         if start:
             # Handle "now" special case - convert to actual timestamp first
             start_for_validation = start
@@ -413,17 +413,36 @@ def list_messages(
                 # Format offset as +08:00
                 offset = start_for_validation[-5:]
                 start_for_validation = start_for_validation[:-2] + ':' + start_for_validation[-2:]
+            else:
+                # For plain timestamps, validate that --timezone is provided
+                has_embedded_tz = (start_for_validation.endswith('Z') or
+                                 '+' in start_for_validation or
+                                 (start_for_validation.count('-') > 2 and '-' in start_for_validation[-6:]))
+                
+                if not has_embedded_tz:
+                    # Plain timestamp - require --timezone parameter
+                    if not display_timezone:
+                        raise ValueError(
+                            f"TIMEZONE_REQUIRED: '{start}' is missing timezone information.\n"
+                            f"--timezone parameter is required when using plain timestamps.\n"
+                            f"Valid formats:\n"
+                            f"  - Plain with --timezone: '2026-03-26T12:00:00' --timezone 'Asia/Shanghai'\n"
+                            f"  - UTC time: '2026-03-26T04:00:00Z'\n"
+                            f"  - With timezone offset: '2026-03-26T12:00:00+08:00'\n"
+                            f"  - Current time: 'now'"
+                        )
+                    # Convert plain timestamp to timezone-aware for validation
+                    try:
+                        tz = ZoneInfo(display_timezone)
+                        local_dt = datetime.fromisoformat(start_for_validation)
+                        local_dt = local_dt.replace(tzinfo=tz)
+                        start_for_validation = local_dt.strftime('%Y-%m-%dT%H:%M:%S%z')
+                        # Format offset as +08:00
+                        offset = start_for_validation[-5:]
+                        start_for_validation = start_for_validation[:-2] + ':' + start_for_validation[-2:]
+                    except Exception as e:
+                        raise ValueError(f"Invalid timestamp or timezone: {start} - {str(e)}")
             
-            # Validate timezone first (strict requirement)
-            if not (start_for_validation.endswith('Z') or '+' in start_for_validation or (start_for_validation.count('-') > 2 and '-' in start_for_validation[-6:])):
-                raise ValueError(
-                    f"TIMEZONE_REQUIRED: '{start}' is missing timezone information.\n"
-                    f"--start requires explicit timezone for unambiguous time handling.\n"
-                    f"Valid formats:\n"
-                    f"  - UTC time: '2026-03-26T04:00:00Z'\n"
-                    f"  - With timezone offset: '2026-03-26T12:00:00+08:00'\n"
-                    f"  - Current time: 'now'"
-                )
             # Convert start to KQL date format (YYYY-MM-DD) - only date is supported by KQL
             start_date = start_for_validation.split('T')[0] if 'T' in start_for_validation else start_for_validation
             search_keywords.append(f"received>={start_date}")
@@ -534,7 +553,10 @@ def list_messages(
         }
         filters.append(f"receivedDateTime lt {end_utc}")
     
-    if filters:
+    # IMPORTANT: Microsoft Graph API doesn't allow $search and $filter together
+    # If using $search (has_search_criteria), we must skip $filter entirely
+    # Time filters should be handled via KQL in $search (already done above)
+    if filters and not has_search_criteria:
         params["$filter"] = " and ".join(filters)
     
     response = api_request('get', url, token, params=params)
@@ -1102,7 +1124,7 @@ def reply_email(
         # Convert literal \n strings to actual newlines (for CLI convenience)
         comment = comment.replace('\\n', '\n')
         # Convert plain text to HTML with proper line breaks
-        comment = comment.replace('\n', '<br>\n')
+        comment = comment.replace('\n', '<br>')
     
     # Determine which endpoint to use
     # /reply - reply to sender only
@@ -1228,7 +1250,7 @@ def batch_reply_email(
     # Build email body with history
     if include_history and body_type == "html":
         if not body.strip().startswith('<'):
-            body = body.replace('\n', '<br>\n')
+            body = body.replace('\n', '<br>')
         full_body = body + "\n\n" + format_email_as_html(original_msg)
     else:
         full_body = body
@@ -1400,7 +1422,7 @@ def forward_email(
         
         if body_type == "html" and not comment.strip().startswith('<'):
             # Convert plain text to HTML with proper line breaks
-            comment = comment.replace('\n', '<br>\n')
+            comment = comment.replace('\n', '<br>')
             # Wrap in HTML body tags for proper rendering
             comment = f"<html><body>{comment}</body></html>"
         elif body_type == "text":
@@ -2610,8 +2632,9 @@ def display_message_list(messages: List[Dict], show_preview: bool = True, show_d
 
 
 def display_message(message: Dict):
-    """Display a single message in detail."""
+    """Display a single message in detail with thread separation."""
     import re
+    import html as html_module
 
     print(f"\n{'='*80}")
     print(f"Subject: {message.get('subject', '(No Subject)')}")
@@ -2656,26 +2679,97 @@ def display_message(message: Dict):
     content = body.get('content', '')
     content_type = body.get('contentType', 'text')
     
-    # If HTML, try to extract plain text
+    # If HTML, extract and parse thread structure
     if content_type == 'html' and content:
-        # Remove HTML tags
-        content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL)
-        content = re.sub(r'<[^>]+>', ' ', content)
-        # Decode HTML entities
-        import html
-        content = html.unescape(content)
-        # Clean up whitespace
-        content = re.sub(r'\s+', ' ', content).strip()
-        # Limit length
-        if len(content) > MAX_MESSAGE_DISPLAY_LENGTH:
-            content = content[:MAX_MESSAGE_DISPLAY_LENGTH] + '...'
-    
-    # Handle encoding issues
-    try:
-        print(f"\n{content}")
-    except UnicodeEncodeError:
-        # Fallback: encode to ASCII with replacement
-        print(f"\n{content.encode('ascii', 'replace').decode('ascii')}")
+        # Remove style and script tags first
+        content = re.sub(r'<style[^>]*>.*?</style>', '', content, flags=re.DOTALL | re.IGNORECASE)
+        content = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL | re.IGNORECASE)
+        
+        # Clean up HTML tags FIRST to make pattern matching easier
+        clean_content = re.sub(r'<[^>]+>', '\n', content)  # Replace tags with newlines to preserve structure
+        clean_content = html_module.unescape(clean_content)
+        # Normalize whitespace but keep newlines
+        clean_content = re.sub(r'[ \t]+', ' ', clean_content)
+        clean_content = re.sub(r'\n\s*\n\s*\n+', '\n\n', clean_content)
+        
+        # Now look for email thread headers in the cleaned text
+        # Pattern: "From: Name <email> Sent: date" (common in forwards/replies)
+        thread_header_pattern = r'From:\s+[^<\n]+<[^>]+>\s+Sent:\s+[^\n]+'
+        
+        # Find all thread boundaries
+        matches = list(re.finditer(thread_header_pattern, clean_content, re.IGNORECASE))
+        
+        threads = []
+        if matches:
+            # Split content by thread headers
+            last_pos = 0
+            for match in matches:
+                # Get content before this thread header (the previous thread)
+                if match.start() > last_pos:
+                    threads.append(clean_content[last_pos:match.start()])
+                # Mark the start of next thread (include the header)
+                last_pos = match.start()
+            # Add the last thread
+            if last_pos < len(clean_content):
+                threads.append(clean_content[last_pos:])
+        else:
+            # No thread headers found - single thread
+            threads = [clean_content]
+        
+        # Display each thread
+        for i, thread_content in enumerate(threads):
+            if not thread_content or not thread_content.strip():
+                continue
+            
+            # Final cleanup
+            thread_content = thread_content.strip()
+            
+            if i > 0:
+                # Add bread line separator between threads
+                print(f"\n{'─'*80}")
+                print(f"📧 Thread {i+1}")
+                print(f"{'─'*80}")
+            
+            # Handle encoding issues
+            try:
+                print(f"\n{thread_content}")
+            except UnicodeEncodeError:
+                print(f"\n{thread_content.encode('ascii', 'replace').decode('ascii')}")
+    else:
+        # Plain text content - also look for thread patterns
+        thread_header_pattern = r'(?:From|发件人):\s*[^\n]+\s+(?:Sent|发送时间):\s*[^\n]+'
+        matches = list(re.finditer(thread_header_pattern, content, re.MULTILINE))
+        
+        if matches:
+            threads = []
+            last_pos = 0
+            for match in matches:
+                if match.start() > last_pos:
+                    threads.append(content[last_pos:match.start()])
+                last_pos = match.start()
+            if last_pos < len(content):
+                threads.append(content[last_pos:])
+            
+            # Display threads with separators
+            for i, thread_content in enumerate(threads):
+                if not thread_content.strip():
+                    continue
+                    
+                if i > 0:
+                    print(f"\n{'─'*80}")
+                    print(f"📧 Thread {i+1}")
+                    print(f"{'─'*80}")
+                
+                try:
+                    print(f"\n{thread_content.strip()}")
+                except UnicodeEncodeError:
+                    print(f"\n{thread_content.strip().encode('ascii', 'replace').decode('ascii')}")
+        else:
+            # Single thread - show as is
+            try:
+                print(f"\n{content}")
+            except UnicodeEncodeError:
+                print(f"\n{content.encode('ascii', 'replace').decode('ascii')}")
     
     print(f"\n{'='*80}")
 
