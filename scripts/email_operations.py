@@ -42,7 +42,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Import configuration and auth
 from config import (
     GRAPH_API_BASE, MAX_RECIPIENTS_PER_EMAIL,
-    MAX_MESSAGE_DISPLAY_LENGTH, MAX_BODY_DISPLAY_LENGTH
+    MAX_MESSAGE_DISPLAY_LENGTH, MAX_BODY_DISPLAY_LENGTH,
+    DEFAULT_EMAIL_LIST_LIMIT
 )
 from auth import get_access_token
 
@@ -268,7 +269,7 @@ def convert_outlook_syntax_args(args) -> list:
 
 def list_messages(
     folder: str = "inbox",
-    limit: int = 25,
+    limit: int = DEFAULT_EMAIL_LIST_LIMIT,
     filter_query: str = None,
     order_by: str = "receivedDateTime desc",
     include_preview: bool = False,
@@ -304,7 +305,10 @@ def list_messages(
         display_timezone: Timezone for display and "now" calculation (default: Asia/Shanghai)
     
     Returns:
-        Tuple of (list of message objects, time_info dict)
+        Tuple of (list of message objects, time_info dict, has_more bool)
+        - messages: List of message dictionaries
+        - time_info: Dict with start/end timezone conversion info (or None)
+        - has_more: True if there are more results beyond the limit
     """
     if token is None:
         token = get_access_token()
@@ -564,6 +568,9 @@ def list_messages(
     data = response.json()
     messages = data.get("value", [])
     
+    # Check if there are more results available (pagination)
+    has_more = '@odata.nextLink' in data
+    
     # Server-side filtering is now complete via KQL $search
     # No client-side filtering needed
     
@@ -585,7 +592,7 @@ def list_messages(
             'end': end_info
         }
     
-    return messages, time_info
+    return messages, time_info, has_more
 
 
 
@@ -775,9 +782,9 @@ def send_email(
     # Validate recipients
     validate_recipients(to, cc, bcc)
     
-    # Convert plain text body to HTML if needed (for proper line breaks)
+    # Convert plain text body to HTML if needed (with proper formatting)
     if body_type == "html" and not body.strip().startswith('<'):
-        body = body.replace('\n', '<br>')
+        body = format_text_to_html(body)
     
     # Build message payload
     message = {
@@ -785,11 +792,16 @@ def send_email(
         "body": {
             "contentType": body_type,
             "content": body
-        },
-        "toRecipients": [format_email_address(e) for e in (to or [])],
-        "ccRecipients": [format_email_address(e) for e in (cc or [])],
-        "bccRecipients": [format_email_address(e) for e in (bcc or [])]
+        }
     }
+    
+    # Add recipients conditionally (allows BCC-only emails)
+    if to:
+        message["toRecipients"] = [format_email_address(e) for e in to]
+    if cc:
+        message["ccRecipients"] = [format_email_address(e) for e in cc]
+    if bcc:
+        message["bccRecipients"] = [format_email_address(e) for e in bcc]
     
     # Add importance if specified
     if importance and importance.lower() in ['low', 'normal', 'high']:
@@ -1123,8 +1135,8 @@ def reply_email(
     if body_type == "html" and not comment.strip().startswith('<'):
         # Convert literal \n strings to actual newlines (for CLI convenience)
         comment = comment.replace('\\n', '\n')
-        # Convert plain text to HTML with proper line breaks
-        comment = comment.replace('\n', '<br>')
+        # Convert plain text to HTML with proper formatting
+        comment = format_text_to_html(comment)
     
     # Determine which endpoint to use
     # /reply - reply to sender only
@@ -1250,8 +1262,44 @@ def batch_reply_email(
     # Build email body with history
     if include_history and body_type == "html":
         if not body.strip().startswith('<'):
-            body = body.replace('\n', '<br>')
+            body = format_text_to_html(body)
         full_body = body + "\n\n" + format_email_as_html(original_msg)
+        
+        # BUGFIX: Preserve inline attachments (embedded images) from original message
+        # When including history, inline images have cid: references that need the attachments
+        original_attachments = original_msg.get('attachments', [])
+        inline_attachment_ids = [att.get('id') for att in original_attachments if att.get('isInline', False)]
+        
+        if inline_attachment_ids:
+            print(f"ℹ️  Preserving {len(inline_attachment_ids)} embedded image(s) from original message")
+            # Fetch full attachment data (including contentBytes) for each inline attachment
+            inline_attachments_full = []
+            for att_id in inline_attachment_ids:
+                try:
+                    # Get full attachment with contentBytes
+                    att_url = f"{GRAPH_API_BASE}/me/messages/{message_id}/attachments/{att_id}"
+                    att_response = api_request('get', att_url, token)
+                    full_att = att_response.json()
+                    
+                    # Convert to send_email format (keep contentBytes, contentType, name, isInline)
+                    inline_att = {
+                        "@odata.type": full_att.get('@odata.type', '#microsoft.graph.fileAttachment'),
+                        "name": full_att.get('name'),
+                        "contentType": full_att.get('contentType'),
+                        "contentBytes": full_att.get('contentBytes'),
+                        "isInline": True,
+                        "contentId": full_att.get('contentId')  # Preserve contentId for cid: references
+                    }
+                    inline_attachments_full.append(inline_att)
+                except Exception as e:
+                    print(f"⚠️  Warning: Failed to fetch inline attachment {att_id}: {str(e)}")
+            
+            # Merge with user-provided attachments
+            if inline_attachments_full:
+                if attachments:
+                    attachments = list(attachments) + inline_attachments_full
+                else:
+                    attachments = inline_attachments_full
     else:
         full_body = body
     
@@ -1385,7 +1433,9 @@ def forward_email(
 ) -> bool:
     """
     Forward an email with original message and attachments included.
-    Uses Microsoft Graph's native forward API to preserve attachments.
+    
+    Uses /sendMail endpoint when BCC recipients are present (Graph /forward doesn't support BCC).
+    Uses Graph's native forward endpoint otherwise to preserve attachments.
     
     Args:
         message_id: ID of message to forward
@@ -1406,28 +1456,123 @@ def forward_email(
     # Validate recipients
     validate_recipients(to, cc, bcc)
     
-    # Use Microsoft Graph's native forward endpoint to preserve attachments
+    # Convert plain text comment to HTML if needed
+    if comment:
+        comment = comment.replace('\\n', '\n')
+        if body_type == "html" and not comment.strip().startswith('<'):
+            comment = format_text_to_html(comment)
+    
+    # If BCC recipients are present, use /sendMail endpoint (Graph /forward doesn't support BCC)
+    if bcc:
+        # Get the original message
+        original_message = get_message(message_id, token)
+        
+        # Build forwarded content
+        original_subject = original_message.get('subject', '')
+        original_from = original_message.get('from', {}).get('emailAddress', {})
+        original_to = original_message.get('toRecipients', [])
+        original_cc = original_message.get('ccRecipients', [])
+        original_body = original_message.get('body', {})
+        original_date = original_message.get('receivedDateTime', '')
+        
+        # Format original date
+        if original_date:
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(original_date.replace('Z', '+00:00'))
+                date_str = dt.strftime('%a, %b %d, %Y at %I:%M %p')
+            except:
+                date_str = original_date
+        else:
+            date_str = 'Unknown date'
+        
+        # Build forward header
+        forward_header = f"<div style='font-family: Arial, sans-serif;'>"
+        if comment:
+            forward_header += f"<div>{comment}</div><br>"
+        
+        forward_header += f"<div style='border-top: 1px solid #cccccc; padding-top: 10px;'>"
+        forward_header += f"<b>From:</b> {original_from.get('name', '')} &lt;{original_from.get('address', '')}&gt;<br>"
+        forward_header += f"<b>Sent:</b> {date_str}<br>"
+        
+        # Format To recipients
+        if original_to:
+            to_str = ', '.join([f"{r.get('emailAddress', {}).get('name', '')} &lt;{r.get('emailAddress', {}).get('address', '')}&gt;" for r in original_to])
+            forward_header += f"<b>To:</b> {to_str}<br>"
+        
+        # Format CC recipients
+        if original_cc:
+            cc_str = ', '.join([f"{r.get('emailAddress', {}).get('name', '')} &lt;{r.get('emailAddress', {}).get('address', '')}&gt;" for r in original_cc])
+            forward_header += f"<b>Cc:</b> {cc_str}<br>"
+        
+        forward_header += f"<b>Subject:</b> {original_subject}"
+        forward_header += f"</div><br>"
+        
+        # Combine header with original body
+        original_content = original_body.get('content', '')
+        if original_body.get('contentType') == 'text':
+            original_content = original_content.replace('\n', '<br>')
+        
+        forwarded_body = forward_header + original_content
+        
+        # Build subject
+        subject = f"FW: {original_subject}" if not original_subject.lower().startswith('fw:') else original_subject
+        
+        # Get attachments from original message with full content
+        attachments = []
+        original_attachments = original_message.get('attachments', [])
+        if original_attachments:
+            print(f"📎 Getting {len(original_attachments)} attachment(s)...")
+            for att in original_attachments:
+                # Download full attachment content
+                att_id = att.get('id')
+                if att_id:
+                    try:
+                        # Get full attachment with content
+                        att_url = f"{GRAPH_API_BASE}/me/messages/{message_id}/attachments/{att_id}"
+                        att_response = api_request('get', att_url, token)
+                        full_att = att_response.json()
+                        
+                        # Build attachment object
+                        attachment_obj = {
+                            "@odata.type": "#microsoft.graph.fileAttachment",
+                            "name": full_att.get('name', 'attachment'),
+                            "contentType": full_att.get('contentType', 'application/octet-stream'),
+                            "contentBytes": full_att.get('contentBytes', '')
+                        }
+                        
+                        # For inline images, preserve the Content-ID for cid: references
+                        if full_att.get('isInline', False):
+                            content_id = full_att.get('contentId')
+                            if content_id:
+                                attachment_obj["contentId"] = content_id
+                            # Mark as inline
+                            attachment_obj["isInline"] = True
+                        
+                        attachments.append(attachment_obj)
+                    except Exception as e:
+                        print(f"⚠️  Warning: Could not get attachment '{att.get('name')}': {e}")
+        
+        # Send using send_email which properly supports BCC
+        send_email(
+            to=to,
+            subject=subject,
+            body=forwarded_body,
+            cc=cc,
+            bcc=bcc,
+            body_type="html",
+            attachments=attachments if attachments else None,
+            token=token
+        )
+        
+        return True
+    
+    # No BCC - use Graph's native forward endpoint (preserves attachments better)
     url = f"{GRAPH_API_BASE}/me/messages/{message_id}/forward"
     
     # Build recipient lists
     to_recipients = [{"emailAddress": {"address": email}} for email in (to or [])]
     cc_recipients = [{"emailAddress": {"address": email}} for email in (cc or [])]
-    bcc_recipients = [{"emailAddress": {"address": email}} for email in (bcc or [])]
-    
-    # Convert plain text comment to HTML if needed
-    # Graph API forward expects HTML in comment field
-    if comment:
-        # First, convert literal \n strings to actual newlines (for CLI convenience)
-        comment = comment.replace('\\n', '\n')
-        
-        if body_type == "html" and not comment.strip().startswith('<'):
-            # Convert plain text to HTML with proper line breaks
-            comment = comment.replace('\n', '<br>')
-            # Wrap in HTML body tags for proper rendering
-            comment = f"<html><body>{comment}</body></html>"
-        elif body_type == "text":
-            # For text, just use as-is
-            pass
     
     # Build payload for Graph API forward
     payload = {
@@ -1437,8 +1582,6 @@ def forward_email(
     
     if cc_recipients:
         payload["ccRecipients"] = cc_recipients
-    if bcc_recipients:
-        payload["bccRecipients"] = bcc_recipients
     
     # Send forward request
     response = api_request('post', url, token, json=payload)
@@ -1500,12 +1643,8 @@ def batch_forward_email(
         # Merge with any manually specified BCC
         bcc = (bcc or []) + csv_bcc
     
-    # Microsoft Graph API requires at least one To recipient for forward
-    # If no To recipient specified but has BCC/CC, add current user as To
-    if not to and (bcc or cc):
-        to = [get_my_email(token)]
-        print(f"ℹ️  Graph API requires To recipient - using current user: {to[0]}")
-        print(f"💡 All other recipients will be in BCC (hidden from each other)")
+    # Note: Graph API's /sendMail endpoint allows sending with only BCC (no To)
+    # This is the standard way to send BCC-only emails
     
     # Calculate total recipients
     to_count = len(to) if to else 0
@@ -1560,10 +1699,7 @@ def batch_forward_email(
     
     # Send each batch
     for idx, batch in enumerate(batches, 1):
-        batch_to_count = len(batch["to"]) if batch["to"] else 0
-        batch_cc_count = len(batch["cc"]) if batch["cc"] else 0
         batch_bcc_count = len(batch["bcc"]) if batch["bcc"] else 0
-        batch_total = batch_to_count + batch_cc_count + batch_bcc_count
         
         try:
             forward_email(
@@ -1575,13 +1711,17 @@ def batch_forward_email(
                 body_type=body_type,
                 token=token
             )
-            sent_count += batch_total
-            print(f"✓ Batch {idx}/{len(batches)} sent successfully ({batch_total} recipients)")
+            # Only count BCC recipients per batch (To/CC are counted once at the end)
+            sent_count += batch_bcc_count
+            print(f"✓ Batch {idx}/{len(batches)} sent successfully ({batch_bcc_count} BCC recipients)")
         except Exception as e:
-            failed_count += batch_total
-            error_msg = f"Batch {idx} ({batch_total} recipients): {str(e)}"
+            failed_count += batch_bcc_count
+            error_msg = f"Batch {idx} ({batch_bcc_count} BCC recipients): {str(e)}"
             errors.append(error_msg)
             print(f"✗ Batch {idx}/{len(batches)} failed: {error_msg}")
+    
+    # Add To and CC recipients to sent count (they were in every batch but only sent once)
+    sent_count += to_count + cc_count
     
     # Prepare response
     response = {
@@ -2037,9 +2177,9 @@ def create_draft_message(
     if token is None:
         token = get_access_token()
     
-    # Convert plain text body to HTML if needed
+    # Convert plain text body to HTML if needed (with proper formatting)
     if body_type == "html" and not body.strip().startswith('<'):
-        body = body.replace('\n', '<br>')
+        body = format_text_to_html(body)
     
     # Build message payload
     message = {
@@ -2047,11 +2187,16 @@ def create_draft_message(
         "body": {
             "contentType": body_type,
             "content": body
-        },
-        "toRecipients": [format_email_address(e) for e in (to or [])],
-        "ccRecipients": [format_email_address(e) for e in (cc or [])],
-        "bccRecipients": [format_email_address(e) for e in (bcc or [])]
+        }
     }
+    
+    # Add recipients conditionally (allows BCC-only emails)
+    if to:
+        message["toRecipients"] = [format_email_address(e) for e in to]
+    if cc:
+        message["ccRecipients"] = [format_email_address(e) for e in cc]
+    if bcc:
+        message["bccRecipients"] = [format_email_address(e) for e in bcc]
     
     # Add importance if specified
     if importance and importance.lower() in ['low', 'normal', 'high']:
@@ -2789,6 +2934,24 @@ def unescape_body(body: str) -> str:
     return body.replace('\\n', '\n').replace('\\t', '\t').replace('\\\\', '\\')
 
 
+def format_text_to_html(text: str) -> str:
+    """
+    Convert plain text to HTML by replacing newlines with <br> tags.
+    
+    Args:
+        text: Plain text to convert
+        
+    Returns:
+        HTML-formatted text with <br> tags for line breaks
+    """
+    if not text or text.strip().startswith('<'):
+        # Already HTML or empty
+        return text
+    
+    # Simple conversion: \n → <br>
+    return text.replace('\n', '<br>')
+
+
 def main():
     parser = argparse.ArgumentParser(description="Microsoft Graph Email Operations")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2799,7 +2962,7 @@ def main():
     # List command (now includes search functionality)
     list_parser = subparsers.add_parser("list", help="List/search messages")
     list_parser.add_argument("--folder", default="inbox", help="Folder name (or 'all' for all folders)")
-    list_parser.add_argument("--limit", "--top", type=int, default=25, dest="limit", help="Max messages to return (--top is alias)")
+    list_parser.add_argument("--limit", "--top", type=int, default=DEFAULT_EMAIL_LIST_LIMIT, dest="limit", help="Max messages to return (--top is alias)")
     list_parser.add_argument("--filter", dest="filter_query", help="OData filter query")
     list_parser.add_argument("--unread", action="store_true", help="Show unread only")
     list_parser.add_argument("--preview", action="store_true", help="Show email body preview")
@@ -2821,7 +2984,7 @@ def main():
     # Search command (complete alias for list, supports all parameters)
     search_parser = subparsers.add_parser("search", help="Search/list messages (alias for list)")
     search_parser.add_argument("--folder", default="inbox", help="Folder name (or 'all' for all folders)")
-    search_parser.add_argument("--limit", "--top", type=int, default=25, dest="limit", help="Max messages to return (--top is alias)")
+    search_parser.add_argument("--limit", "--top", type=int, default=DEFAULT_EMAIL_LIST_LIMIT, dest="limit", help="Max messages to return (--top is alias)")
     search_parser.add_argument("--filter", dest="filter_query", help="OData filter query")
     search_parser.add_argument("--unread", action="store_true", help="Show unread only")
     search_parser.add_argument("--preview", action="store_true", help="Show email body preview")
@@ -2843,7 +3006,7 @@ def main():
     # Find command (complete alias for list, supports all parameters)
     find_parser = subparsers.add_parser("find", help="Find/list messages (alias for list)")
     find_parser.add_argument("--folder", default="inbox", help="Folder name (or 'all' for all folders)")
-    find_parser.add_argument("--limit", "--top", type=int, default=25, dest="limit", help="Max messages to return (--top is alias)")
+    find_parser.add_argument("--limit", "--top", type=int, default=DEFAULT_EMAIL_LIST_LIMIT, dest="limit", help="Max messages to return (--top is alias)")
     find_parser.add_argument("--filter", dest="filter_query", help="OData filter query")
     find_parser.add_argument("--unread", action="store_true", help="Show unread only")
     find_parser.add_argument("--preview", action="store_true", help="Show email body preview")
@@ -2888,10 +3051,12 @@ def main():
     reply_parser = subparsers.add_parser("reply", help="Reply to an email (auto-batch for large recipient lists)")
     reply_parser.add_argument("message_id", help="Message ID to reply to")
     reply_parser.add_argument("--body", required=True, help="Reply body")
-    reply_parser.add_argument("--sender-only", dest="reply_all", action="store_false", 
+    reply_parser.add_argument("--sender-only", dest="reply_all", action="store_false",
                               help="Reply only to sender (default: reply to all)")
-    reply_parser.add_argument("--to", help="Additional To recipients (comma-separated)")
-    reply_parser.add_argument("--cc", help="Additional CC recipients (comma-separated)")
+    reply_parser.add_argument("--to", help="Replace To recipients with this list (comma-separated)")
+    reply_parser.add_argument("--cc", help="Replace CC recipients with this list (comma-separated)")
+    reply_parser.add_argument("--add-to", help="Add To recipients to original list (comma-separated)")
+    reply_parser.add_argument("--add-cc", help="Add CC recipients to original list (comma-separated)")
     reply_parser.add_argument("--bcc", help="BCC recipients (comma-separated)")
     reply_parser.add_argument("--csv", dest="csv_path", help="CSV file containing BCC email addresses")
     reply_parser.add_argument("--email-column", help="Column name in CSV for emails (auto-detected if not specified)")
@@ -2906,7 +3071,7 @@ def main():
     forward_parser.add_argument("--bcc", help="BCC recipients (comma-separated)")
     forward_parser.add_argument("--csv", dest="csv_path", help="CSV file containing BCC email addresses")
     forward_parser.add_argument("--email-column", help="Column name in CSV for emails (auto-detected if not specified)")
-    forward_parser.add_argument("--comment", default="", help="Comment to add")
+    forward_parser.add_argument("--comment", "--body", default="", dest="comment", help="Comment/body to add (--body is alias)")
     
     # Mark read/unread
     read_parser = subparsers.add_parser("read", help="Mark message as read/unread")
@@ -2978,7 +3143,7 @@ def main():
             elif getattr(args, 'events_only', False):
                 message_type = "events"
             
-            messages, time_info = list_messages(
+            messages, time_info, has_more = list_messages(
                 folder=args.folder,
                 limit=args.limit,
                 filter_query=filter_query,
@@ -3003,7 +3168,7 @@ def main():
                 messages = detailed_messages
             
             if args.json:
-                result = {"success": True, "messages": messages, "total": len(messages)}
+                result = {"success": True, "messages": messages, "total": len(messages), "has_more": has_more}
                 if time_info:
                     if time_info.get('start'):
                         result["start_info"] = {
@@ -3015,12 +3180,14 @@ def main():
                             **time_info['end'],
                             "_description": f"Emails received before {time_info['end']['original']}"
                         }
+                if has_more:
+                    result["_warning"] = f"Only showing first {len(messages)} results. Use --limit to increase (current: {args.limit})"
                 print(json.dumps(result, indent=2, default=str))
             else:
                 # Use user-specified timezone for display
                 display_tz = getattr(args, 'timezone', None)
                 
-                # Display timezone first
+                # Display timezone
                 if display_tz:
                     print(f"   Display Timezone: {display_tz}")
                 
@@ -3044,10 +3211,10 @@ def main():
                                     pass
                             # Format cleanly without timezone suffix
                             start_formatted = start_dt.strftime('%Y-%m-%d %H:%M')
-                            print(f"\n📅 Start: {start_formatted}")
+                            print(f"📅 Start: {start_formatted}")
                         except:
                             # Fallback to original if parsing fails
-                            print(f"\n📅 Start: {start_original}")
+                            print(f"📅 Start: {start_original}")
                     
                     if time_info.get('end'):
                         # Parse and format the end timestamp in a clean way
@@ -3067,12 +3234,117 @@ def main():
                                     pass
                             # Format cleanly without timezone suffix
                             end_formatted = end_dt.strftime('%Y-%m-%d %H:%M')
-                            print(f"\n📅 End: {end_formatted}")
+                            print(f"📅 End: {end_formatted}")
                         except:
                             # Fallback to original if parsing fails
-                            print(f"\n📅 End: {end_original}")
-                    
+                            print(f"📅 End: {end_original}")
                 display_message_list(messages, show_preview=True, show_detail=show_detail, display_timezone=display_tz, message_type=message_type)
+                
+                # Display warning at the END (after email list) so users see it immediately when terminal scrolls to bottom
+                if has_more and messages:
+                    # Get the time range of displayed messages
+                    # NOTE: Messages are sorted by receivedDateTime desc (newest first)
+                    # So messages[0] = newest, messages[-1] = oldest
+                    newest_email = messages[0]
+                    oldest_email = messages[-1]
+                    
+                    newest_time = newest_email.get('receivedDateTime', '')
+                    oldest_time = oldest_email.get('receivedDateTime', '')
+                    
+                    if newest_time and oldest_time:
+                        # Parse and format times in user's timezone
+                        try:
+                            newest_dt = datetime.fromisoformat(newest_time.replace('Z', '+00:00'))
+                            oldest_dt = datetime.fromisoformat(oldest_time.replace('Z', '+00:00'))
+                            
+                            # Convert to display timezone
+                            if display_tz:
+                                try:
+                                    if isinstance(display_tz, str):
+                                        tz_obj = ZoneInfo(display_tz)
+                                    else:
+                                        tz_obj = display_tz
+                                    newest_dt = newest_dt.astimezone(tz_obj)
+                                    oldest_dt = oldest_dt.astimezone(tz_obj)
+                                except:
+                                    pass
+                            
+                            # Display in chronological order (oldest to newest)
+                            oldest_formatted = oldest_dt.strftime('%Y-%m-%d %H:%M')
+                            newest_formatted = newest_dt.strftime('%Y-%m-%d %H:%M')
+                            
+                            # Build the next command suggestion
+                            # Since results are sorted newest first, more results are OLDER
+                            # So we need to set --end to just before the oldest email shown
+                            from datetime import timedelta
+                            next_end_dt = oldest_dt - timedelta(seconds=1)
+                            next_end = next_end_dt.strftime('%Y-%m-%dT%H:%M:%S')
+                            
+                            # Build command with current search parameters
+                            cmd_parts = ["python scripts/email_operations.py", args.command]
+                            
+                            # Add folder if not default
+                            if args.folder != "inbox":
+                                cmd_parts.append(f'--folder "{args.folder}"')
+                            
+                            # Add search parameters if they were used
+                            if getattr(args, 'from_sender', None):
+                                cmd_parts.append(f'--from "{args.from_sender}"')
+                            if getattr(args, 'to_recipient', None):
+                                cmd_parts.append(f'--to "{args.to_recipient}"')
+                            if getattr(args, 'subject', None):
+                                cmd_parts.append(f'--subject "{args.subject}"')
+                            if getattr(args, 'body', None):
+                                cmd_parts.append(f'--body "{args.body}"')
+                            
+                            # Keep the original start time if it was specified
+                            if getattr(args, 'start', None):
+                                cmd_parts.append(f'--start "{args.start}"')
+                            
+                            # Set --end to just before the oldest email shown
+                            cmd_parts.append(f'--end "{next_end}"')
+                            
+                            # Add timezone
+                            cmd_parts.append(f'--timezone "{args.timezone}"')
+                            
+                            # Add limit
+                            cmd_parts.append(f'--limit {args.limit}')
+                            
+                            # Add message type filters if used
+                            if getattr(args, 'emails_only', False):
+                                cmd_parts.append('--emails-only')
+                            elif getattr(args, 'events_only', False):
+                                cmd_parts.append('--events-only')
+                            
+                            # Add other filters
+                            if getattr(args, 'unread', False):
+                                cmd_parts.append('--unread')
+                            if getattr(args, 'focused', False):
+                                cmd_parts.append('--focused')
+                            elif getattr(args, 'other', False):
+                                cmd_parts.append('--other')
+                            
+                            next_command = ' '.join(cmd_parts)
+                            
+                            print(f"\n{'='*80}")
+                            print(f"⚠️  SHOWING PARTIAL RESULTS")
+                            print(f"{'='*80}")
+                            print(f"📅 Time range: {oldest_formatted} to {newest_formatted} (oldest to newest)")
+                            print(f"📊 Showing: {len(messages)} emails (limit: {args.limit})")
+                            print(f"⚠️  More emails exist before {oldest_formatted}")
+                            print(f"\n💡 To get the next batch (older emails), run:")
+                            print(f"\n   {next_command}\n")
+                            print(f"{'='*80}\n")
+                        except Exception as e:
+                            # Fallback to simple warning if date parsing fails
+                            print(f"\n⚠️  Note: Only showing first {len(messages)} results (limit: {args.limit})")
+                            print(f"   There are more emails matching your criteria.")
+                            print(f"   Use --limit <number> to see more results (e.g., --limit 50, --limit 100)\n")
+                    else:
+                        # Fallback if no timestamps available
+                        print(f"\n⚠️  Note: Only showing first {len(messages)} results (limit: {args.limit})")
+                        print(f"   There are more emails matching your criteria.")
+                        print(f"   Use --limit <number> to see more results (e.g., --limit 50, --limit 100)\n")
         
         elif args.command == "get":
             message = get_message(args.message_id)
@@ -3212,11 +3484,67 @@ def main():
                     print(f"✗ Error preparing attachments: {str(e)}")
                     sys.exit(1)
             
+            # Handle --add-to and --add-cc flags: merge with original recipients
+            final_to = None
+            final_cc = None
+            
+            if hasattr(args, 'add_to') and args.add_to:
+                # Get original message to extract recipients
+                original_msg = get_message(args.message_id)
+                my_email = get_my_email()
+                
+                # Extract original recipients (reply-all behavior)
+                from_addr = original_msg.get('from', {}).get('emailAddress', {})
+                sender_email = from_addr.get('address', '')
+                
+                to_recipients = original_msg.get('toRecipients', [])
+                other_to_emails = [
+                    r.get('emailAddress', {}).get('address', '')
+                    for r in to_recipients
+                    if r.get('emailAddress', {}).get('address', '').lower() != my_email.lower()
+                ]
+                
+                # Build base To list: sender + other To recipients
+                base_to = []
+                if sender_email:
+                    base_to.append(sender_email)
+                base_to.extend(other_to_emails)
+                
+                # Add the new recipients
+                additional_to = parse_email_list(args.add_to)
+                final_to = base_to + additional_to
+                
+                print(f"ℹ️  Adding {len(additional_to)} recipient(s) to original To list ({len(base_to)} original)")
+            elif args.to:
+                # Use --to for full replacement
+                final_to = parse_email_list(args.to)
+            
+            if hasattr(args, 'add_cc') and args.add_cc:
+                # Get original message if not already fetched
+                if final_to is None or not hasattr(args, 'add_to') or not args.add_to:
+                    original_msg = get_message(args.message_id)
+                
+                # Extract original CC recipients
+                cc_recipients = original_msg.get('ccRecipients', [])
+                base_cc = [
+                    r.get('emailAddress', {}).get('address', '')
+                    for r in cc_recipients
+                ]
+                
+                # Add the new recipients
+                additional_cc = parse_email_list(args.add_cc)
+                final_cc = base_cc + additional_cc
+                
+                print(f"ℹ️  Adding {len(additional_cc)} recipient(s) to original CC list ({len(base_cc)} original)")
+            elif args.cc:
+                # Use --cc for full replacement
+                final_cc = parse_email_list(args.cc)
+            
             # Determine which function to use:
             # - Standard reply_email: when replying to original sender only (no extra recipients/attachments)
             # - batch_reply_email: when adding custom recipients via --to/--cc/--bcc/--csv or attachments
             # - Draft workflow: when large files are present
-            has_extra_recipients = args.to or args.cc or args.bcc or getattr(args, 'csv_path', None)
+            has_extra_recipients = final_to or final_cc or args.bcc or getattr(args, 'csv_path', None)
             has_attachments = inline_attachments is not None or large_files
             
             # Large files require draft workflow
@@ -3240,7 +3568,7 @@ def main():
                 # Prepend our new content to existing body (which has the thread)
                 new_content = args.body
                 if not new_content.strip().startswith('<'):
-                    new_content = new_content.replace('\n', '<br>')
+                    new_content = format_text_to_html(new_content)
                 
                 # Combine: new content + existing thread
                 combined_body = f"{new_content}<br><br>{existing_body}"
@@ -3296,8 +3624,8 @@ def main():
                 result = batch_reply_email(
                     message_id=args.message_id,
                     body=args.body,
-                    to=parse_email_list(args.to) if args.to else None,
-                    cc=parse_email_list(args.cc) if args.cc else None,
+                    to=final_to,
+                    cc=final_cc,
                     bcc=parse_email_list(args.bcc) if args.bcc else None,
                     csv_path=getattr(args, 'csv_path', None),
                     email_column=getattr(args, 'email_column', None),
@@ -3322,6 +3650,9 @@ def main():
                     print("✓ Reply sent successfully")
         
         elif args.command == "forward":
+            # Handle both --comment and --body (they're aliases via dest="comment")
+            comment = args.comment if args.comment else ""
+            
             result = batch_forward_email(
                 message_id=args.message_id,
                 to=parse_email_list(args.to) if args.to else None,
@@ -3329,7 +3660,7 @@ def main():
                 bcc=parse_email_list(args.bcc) if args.bcc else None,
                 csv_path=getattr(args, 'csv_path', None),
                 email_column=getattr(args, 'email_column', None),
-                comment=args.comment
+                comment=comment
             )
             if args.json:
                 print(json.dumps(result, indent=2))

@@ -63,6 +63,9 @@ MAX_RETRIES = 3
 # Maximum recipients per email (company policy)
 MAX_RECIPIENTS_PER_EMAIL = 500
 
+# Default limit for email list/search results
+DEFAULT_EMAIL_LIST_LIMIT = 25
+
 # Default email body type
 DEFAULT_BODY_TYPE = "html"  # "html" or "text"
 
